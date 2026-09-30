@@ -40,6 +40,10 @@ class MSW_Compressor {
 			return new WP_Error( 'msw_compress', 'Image not found in index.' );
 		}
 
+		if ( 'active' !== $image['status'] ) {
+			return new WP_Error( 'msw_compress', 'Image is not active (trashed or removed).' );
+		}
+
 		if ( $image['compressed'] && ! $force ) {
 			return new WP_Error( 'msw_already_compressed', 'Image already compressed.' );
 		}
@@ -47,6 +51,9 @@ class MSW_Compressor {
 		$path = $image['file_path'];
 		if ( ! is_file( $path ) || ! is_writable( $path ) || ! is_writable( dirname( $path ) ) ) {
 			return new WP_Error( 'msw_compress', 'File missing or not writable: ' . $path );
+		}
+		if ( ! MSW_Files::within_uploads( $path ) ) {
+			return new WP_Error( 'msw_compress', 'Refusing to touch a file outside the uploads directory.' );
 		}
 
 		$options = array(
@@ -82,6 +89,10 @@ class MSW_Compressor {
 		}
 
 		// 3. Replace original with the accepted temp output.
+		if ( ! MSW_Files::within_uploads( $result['output_file'] ) ) {
+			@unlink( $result['output_file'] );
+			return new WP_Error( 'msw_compress', 'Engine output escaped the uploads directory; aborted.' );
+		}
 		if ( ! @rename( $result['output_file'], $path ) ) {
 			if ( is_file( $result['output_file'] ) ) {
 				@unlink( $result['output_file'] );
@@ -149,6 +160,9 @@ class MSW_Compressor {
 		}
 
 		$backup = $image['file_path'] . self::BACKUP_SUFFIX;
+		if ( ! MSW_Files::within_uploads( $backup ) ) {
+			return new WP_Error( 'msw_restore', 'Refusing to touch a file outside the uploads directory.' );
+		}
 		if ( ! is_file( $backup ) ) {
 			return new WP_Error( 'msw_restore', 'No backup file found.' );
 		}
@@ -213,12 +227,12 @@ class MSW_Compressor {
 				}
 				$placeholders = implode( ',', array_fill( 0, count( $ids ), '%d' ) );
 				$rows = $wpdb->get_results(
-					$wpdb->prepare( "SELECT id, file_name FROM {$table} WHERE id IN ({$placeholders}) AND compressed = 0 AND is_thumbnail = 0", ...$ids ), // phpcs:ignore
+					$wpdb->prepare( "SELECT id, file_name FROM {$table} WHERE id IN ({$placeholders}) AND compressed = 0 AND is_thumbnail = 0 AND status = 'active'", ...$ids ), // phpcs:ignore
 					ARRAY_A
 				);
 			} else {
 				$rows = $wpdb->get_results(
-					$wpdb->prepare( "SELECT id, file_name FROM {$table} WHERE compressed = 0 AND is_thumbnail = 0 AND id > %d ORDER BY id ASC LIMIT %d", $cursor['last_id'], $batch ),
+					$wpdb->prepare( "SELECT id, file_name FROM {$table} WHERE compressed = 0 AND is_thumbnail = 0 AND status = 'active' AND id > %d ORDER BY id ASC LIMIT %d", $cursor['last_id'], $batch ),
 					ARRAY_A
 				);
 			}
@@ -275,7 +289,7 @@ class MSW_Compressor {
 
 		if ( null === $selected ) {
 			$remaining = (int) $wpdb->get_var(
-				$wpdb->prepare( "SELECT COUNT(*) FROM {$table} WHERE compressed = 0 AND is_thumbnail = 0 AND id > %d", $cursor['last_id'] )
+				$wpdb->prepare( "SELECT COUNT(*) FROM {$table} WHERE compressed = 0 AND is_thumbnail = 0 AND status = 'active' AND id > %d", $cursor['last_id'] )
 			);
 			if ( 0 === $remaining ) {
 				MSW_Logger::info(

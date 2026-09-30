@@ -32,6 +32,9 @@ class MSW_Reference_Detector {
 	const STATUS_ORPHAN = 'orphan';
 	const STATUS_UNKNOWN = 'unknown';
 
+	/** @var string[] Reference types that only count as "maybe used". */
+	const SOFT_TYPES = array( 'post_content_maybe', 'theme_maybe', 'plugin_maybe' );
+
 	/**
 	 * Start (or resume) a full reference scan.
 	 *
@@ -217,12 +220,15 @@ class MSW_Reference_Detector {
 	 * Extract uploads references from a chunk of content and store hits.
 	 *
 	 * @param string $content Content.
-	 * @param string $type    Reference type.
+	 * @param string $type    Reference type (post_content | theme | plugin).
 	 * @param int    $ref_id  Reference id (post id / 0).
 	 * @param string $source  Human readable source label.
 	 * @param array  $cursor  Cursor (found counter updated in place).
+	 * @param bool   $strong  Strong reference (code files). Weak sources like
+	 *                        READMEs record "maybe" hits that never mark an
+	 *                        image as used on their own.
 	 */
-	protected static function find_refs_in_content( $content, $type, $ref_id, $source, &$cursor ) {
+	protected static function find_refs_in_content( $content, $type, $ref_id, $source, &$cursor, $strong = true ) {
 		global $wpdb;
 
 		if ( ! is_string( $content ) || '' === $content ) {
@@ -230,47 +236,102 @@ class MSW_Reference_Detector {
 		}
 
 		$images = MSW_Database::table( MSW_Database::IMAGES );
+		$maybe_type = in_array( $type, array( 'theme', 'plugin' ), true ) ? $type . '_maybe' : 'post_content_maybe';
 
-		// 1. Exact matches: uploads relative paths.
+		// 1. Exact matches: uploads relative paths. When content points at a
+		// size variant URL, the reference belongs to its parent original.
 		if ( preg_match_all( '#wp-content/uploads/([^\s"\'\)\>\\\\]+)#i', $content, $m ) ) {
 			$candidates = array_unique( array_map( 'rawurldecode', $m[1] ) );
 			$placeholders = implode( ',', array_fill( 0, count( $candidates ), '%s' ) );
 			$found = $wpdb->get_results(
 				$wpdb->prepare(
-					"SELECT id, attachment_id, file_rel_path FROM {$images} WHERE file_rel_path IN ({$placeholders})", // phpcs:ignore
+					"SELECT id, parent_file_id FROM {$images} WHERE file_rel_path IN ({$placeholders}) AND status = 'active'", // phpcs:ignore
 					$candidates
 				),
 				ARRAY_A
 			);
 
+			$targets = array();
 			foreach ( (array) $found as $hit ) {
-				self::store_ref( $hit['id'], 'post_content', $ref_id, $source, $cursor );
+				$targets[] = $hit['parent_file_id'] > 0 ? (int) $hit['parent_file_id'] : (int) $hit['id'];
+			}
+			foreach ( array_unique( $targets ) as $target_id ) {
+				self::store_ref( $target_id, $type, $ref_id, $source, $cursor );
+			}
+		}
 
-				// Gutenberg blocks carry an explicit id attribute.
-				if ( 'post_content' === $type && false !== strpos( $content, '<!-- wp:' ) ) {
-					if ( preg_match( '/"id":\s*' . (int) $hit['attachment_id'] . '\b/', $content )
-						|| preg_match( '/\bid=["\']' . (int) $hit['attachment_id'] . '["\']/', $content ) ) {
-						self::store_ref( $hit['id'], 'gutenberg', $ref_id, $source, $cursor );
-					}
+		// 2. Gutenberg blocks: parse natively and collect attachment ids.
+		if ( 'post_content' === $type && false !== strpos( $content, '<!-- wp:' ) && function_exists( 'parse_blocks' ) ) {
+			$block_ids = array();
+			self::collect_block_ids_recursive( parse_blocks( $content ), $block_ids );
+
+			if ( $block_ids ) {
+				$placeholders = implode( ',', array_fill( 0, count( $block_ids ), '%d' ) );
+				$found = $wpdb->get_results(
+					$wpdb->prepare(
+						"SELECT id, parent_file_id FROM {$images} WHERE attachment_id IN ({$placeholders}) AND status = 'active'", // phpcs:ignore
+						$block_ids
+					),
+					ARRAY_A
+				);
+				$targets = array();
+				foreach ( (array) $found as $hit ) {
+					$targets[] = $hit['parent_file_id'] > 0 ? (int) $hit['parent_file_id'] : (int) $hit['id'];
+				}
+				foreach ( array_unique( $targets ) as $target_id ) {
+					self::store_ref( $target_id, 'gutenberg', $ref_id, $source, $cursor );
 				}
 			}
 		}
 
-		// 2. Fuzzy matches: bare file names (maybe-used).
+		// 3. Fuzzy matches: bare file names (maybe-used).
 		if ( preg_match_all( '/[\w\-.]+\.(?:jpe?g|png|webp|avif)/i', $content, $names ) ) {
 			$basenames = array_unique( array_map( 'rawurldecode', $names[0] ) );
 			if ( $basenames ) {
 				$placeholders = implode( ',', array_fill( 0, count( $basenames ), '%s' ) );
 				$found = $wpdb->get_results(
 					$wpdb->prepare(
-						"SELECT id FROM {$images} WHERE file_name IN ({$placeholders})", // phpcs:ignore
+						"SELECT id, parent_file_id FROM {$images} WHERE file_name IN ({$placeholders}) AND status = 'active'", // phpcs:ignore
 						$basenames
 					),
 					ARRAY_A
 				);
 				foreach ( (array) $found as $hit ) {
-					self::store_ref( $hit['id'], 'post_content_maybe', $ref_id, $source, $cursor );
+					$target_id = $hit['parent_file_id'] > 0 ? (int) $hit['parent_file_id'] : (int) $hit['id'];
+					self::store_ref( $target_id, $maybe_type, $ref_id, $source, $cursor );
 				}
+			}
+		}
+	}
+
+	/**
+	 * Collect attachment ids from parsed Gutenberg blocks (any block type,
+	 * recursively — image, gallery, media-text, cover, third-party blocks…).
+	 *
+	 * @param array $blocks Parsed blocks.
+	 * @param int[] $ids    Output accumulator.
+	 */
+	protected static function collect_block_ids_recursive( $blocks, &$ids ) {
+		foreach ( (array) $blocks as $block ) {
+			if ( ! is_array( $block ) ) {
+				continue;
+			}
+
+			$attrs = isset( $block['attrs'] ) && is_array( $block['attrs'] ) ? $block['attrs'] : array();
+			foreach ( $attrs as $key => $value ) {
+				if ( 'id' === $key && is_numeric( $value ) && (int) $value > 0 ) {
+					$ids[] = (int) $value;
+				} elseif ( 'ids' === $key && is_array( $value ) ) {
+					foreach ( $value as $nested ) {
+						if ( is_numeric( $nested ) && (int) $nested > 0 ) {
+							$ids[] = (int) $nested;
+						}
+					}
+				}
+			}
+
+			if ( ! empty( $block['innerBlocks'] ) && is_array( $block['innerBlocks'] ) ) {
+				self::collect_block_ids_recursive( $block['innerBlocks'], $ids );
 			}
 		}
 	}
@@ -360,19 +421,43 @@ class MSW_Reference_Detector {
 				continue;
 			}
 
-			$ids = array();
-			self::collect_ids_recursive( $data, $ids );
-			if ( ! $ids ) {
-				continue;
-			}
+			$ids  = array();
+			$urls = array();
+			self::collect_media_refs_recursive( $data, $ids, $urls );
 
 			$images = MSW_Database::table( MSW_Database::IMAGES );
-			$placeholders = implode( ',', array_fill( 0, count( $ids ), '%d' ) );
-			$found = $wpdb->get_col(
-				$wpdb->prepare( "SELECT id FROM {$images} WHERE attachment_id IN ({$placeholders})", $ids ) // phpcs:ignore
-			);
-			foreach ( (array) $found as $image_id ) {
-				self::store_ref( $image_id, 'elementor', (int) $row['post_id'], '_elementor_data', $cursor );
+
+			// Attachment-id references.
+			if ( $ids ) {
+				$placeholders = implode( ',', array_fill( 0, count( $ids ), '%d' ) );
+				$found = $wpdb->get_results(
+					$wpdb->prepare( "SELECT id, parent_file_id FROM {$images} WHERE attachment_id IN ({$placeholders}) AND status = 'active'", $ids ), // phpcs:ignore
+					ARRAY_A
+				);
+				foreach ( (array) $found as $hit ) {
+					$target = $hit['parent_file_id'] > 0 ? (int) $hit['parent_file_id'] : (int) $hit['id'];
+					self::store_ref( $target, 'elementor', (int) $row['post_id'], '_elementor_data', $cursor );
+				}
+			}
+
+			// URL references: Elementor widgets often store the file URL, not the id.
+			$rels = array();
+			foreach ( $urls as $url ) {
+				if ( preg_match( '#wp-content/uploads/([^\s"\'\)\>\\\\]+)#i', $url, $mm ) ) {
+					$rels[] = rawurldecode( $mm[1] );
+				}
+			}
+			$rels = array_values( array_unique( $rels ) );
+			if ( $rels ) {
+				$placeholders = implode( ',', array_fill( 0, count( $rels ), '%s' ) );
+				$found = $wpdb->get_results(
+					$wpdb->prepare( "SELECT id, parent_file_id FROM {$images} WHERE file_rel_path IN ({$placeholders}) AND status = 'active'", $rels ), // phpcs:ignore
+					ARRAY_A
+				);
+				foreach ( (array) $found as $hit ) {
+					$target = $hit['parent_file_id'] > 0 ? (int) $hit['parent_file_id'] : (int) $hit['id'];
+					self::store_ref( $target, 'elementor', (int) $row['post_id'], '_elementor_data', $cursor );
+				}
 			}
 		}
 
@@ -380,22 +465,24 @@ class MSW_Reference_Detector {
 	}
 
 	/**
-	 * Collect "id" values (attachments) from Elementor data structures.
+	 * Collect attachment ids and media URLs from Elementor data structures.
 	 *
-	 * @param array $data Parsed JSON.
-	 * @param int[] $ids  Output accumulator.
+	 * @param array    $data Parsed JSON.
+	 * @param int[]    $ids  Id accumulator.
+	 * @param string[] $urls URL accumulator.
 	 */
-	protected static function collect_ids_recursive( $data, &$ids ) {
+	protected static function collect_media_refs_recursive( $data, &$ids, &$urls ) {
 		foreach ( $data as $key => $value ) {
 			if ( 'id' === $key && is_numeric( $value ) && (int) $value > 0 ) {
 				$ids[] = (int) $value;
-			} elseif ( 'id' === $key && is_string( $value ) ) {
-				// Elementor uses random string ids for elements; attachment widgets use "id" numeric — skip strings.
-				continue;
+			}
+
+			if ( is_string( $value ) && false !== strpos( $value, '/uploads/' ) && ( 0 === strpos( $value, 'http' ) || 0 === strpos( $value, '/' ) ) ) {
+				$urls[] = $value;
 			}
 
 			if ( is_array( $value ) ) {
-				self::collect_ids_recursive( $value, $ids );
+				self::collect_media_refs_recursive( $value, $ids, $urls );
 			}
 		}
 	}
@@ -435,7 +522,10 @@ class MSW_Reference_Detector {
 			}
 
 			$source = ltrim( substr( $path, strlen( WP_CONTENT_DIR ) ), '/' );
-			self::find_refs_in_content( $content, $type, 0, $source, $cursor );
+			$ext    = strtolower( pathinfo( $path, PATHINFO_EXTENSION ) );
+			// Code files reference media for real; docs/READMEs only mention it.
+			$strong = in_array( $ext, array( 'php', 'css', 'js', 'scss' ), true );
+			self::find_refs_in_content( $content, $type, 0, $source, $cursor, $strong );
 		}
 
 		if ( $cursor['file_idx'] >= $total ) {
@@ -496,9 +586,9 @@ class MSW_Reference_Detector {
 		$rows = $wpdb->get_results(
 			$wpdb->prepare(
 				"SELECT i.id, i.attachment_id,
-					( SELECT COUNT(*) FROM {$refs} r WHERE r.image_id = i.id AND r.reference_type <> 'post_content_maybe' ) AS hard,
-					( SELECT COUNT(*) FROM {$refs} r WHERE r.image_id = i.id AND r.reference_type = 'post_content_maybe' ) AS soft
-				FROM {$images} i WHERE i.id > %d AND i.is_thumbnail = 0 ORDER BY i.id ASC LIMIT %d", // phpcs:ignore
+					( SELECT COUNT(*) FROM {$refs} r WHERE r.image_id = i.id AND r.reference_type NOT IN ('post_content_maybe','theme_maybe','plugin_maybe') ) AS hard,
+					( SELECT COUNT(*) FROM {$refs} r WHERE r.image_id = i.id AND r.reference_type IN ('post_content_maybe','theme_maybe','plugin_maybe') ) AS soft
+				FROM {$images} i WHERE i.id > %d AND i.is_thumbnail = 0 AND i.status = 'active' ORDER BY i.id ASC LIMIT %d", // phpcs:ignore
 				$cursor['last_id'],
 				$batch
 			),
@@ -511,7 +601,7 @@ class MSW_Reference_Detector {
 				$wpdb->prepare(
 					"UPDATE {$images} t JOIN {$images} p ON t.parent_file_id = p.id " // phpcs:ignore
 					. 'SET t.reference_status = p.reference_status, t.reference_count = p.reference_count, t.analyzed_at = %s '
-					. 'WHERE t.is_thumbnail = 1 AND t.parent_file_id > 0',
+					. "WHERE t.is_thumbnail = 1 AND t.parent_file_id > 0 AND t.status = 'active'",
 					current_time( 'mysql', true )
 				)
 			);
@@ -668,9 +758,10 @@ class MSW_Reference_Detector {
 			);
 			foreach ( (array) $elementor as $row ) {
 				$ids = array();
+				$urls = array();
 				$data = json_decode( (string) $row['meta_value'], true );
 				if ( is_array( $data ) ) {
-					self::collect_ids_recursive( $data, $ids );
+					self::collect_media_refs_recursive( $data, $ids, $urls );
 				}
 				if ( in_array( $att_id, $ids, true ) || false !== strpos( (string) $row['meta_value'], $rel ) ) {
 					self::store_ref( $image_id, 'elementor', (int) $row['post_id'], '_elementor_data', $cursor );
@@ -692,8 +783,8 @@ class MSW_Reference_Detector {
 		}
 
 		// Re-aggregate status for this row.
-		$hard = (int) $wpdb->get_var( $wpdb->prepare( "SELECT COUNT(*) FROM {$refs_table} WHERE image_id = %d AND reference_type <> 'post_content_maybe'", $image_id ) );
-		$soft = (int) $wpdb->get_var( $wpdb->prepare( "SELECT COUNT(*) FROM {$refs_table} WHERE image_id = %d AND reference_type = 'post_content_maybe'", $image_id ) );
+		$hard = (int) $wpdb->get_var( $wpdb->prepare( "SELECT COUNT(*) FROM {$refs_table} WHERE image_id = %d AND reference_type NOT IN ('post_content_maybe','theme_maybe','plugin_maybe')", $image_id ) );
+		$soft = (int) $wpdb->get_var( $wpdb->prepare( "SELECT COUNT(*) FROM {$refs_table} WHERE image_id = %d AND reference_type IN ('post_content_maybe','theme_maybe','plugin_maybe')", $image_id ) );
 
 		$status = self::STATUS_UNUSED;
 		if ( 0 === $att_id ) {
@@ -758,6 +849,10 @@ class MSW_Reference_Detector {
 				return sprintf( 'WooCommerce gallery of product #%d', $ref['reference_id'] );
 			case 'elementor':
 				return sprintf( 'Elementor page #%d', $ref['reference_id'] );
+			case 'theme_maybe':
+				return 'Theme file (name match): ' . $ref['source'];
+			case 'plugin_maybe':
+				return 'Plugin file (name match): ' . $ref['source'];
 			case 'theme':
 				return 'Theme file: ' . $ref['source'];
 			case 'plugin':

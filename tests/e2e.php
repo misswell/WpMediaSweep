@@ -150,7 +150,9 @@ check( 'file moved to ms-trash', is_dir( $basedir . '/ms-trash' ) && ! is_file( 
 $att6 = get_post( 6 );
 check( 'attachment 6 in WP trash', $att6 && 'trash' === $att6->post_status );
 check( 'manifest.json written', (bool) glob( $basedir . '/ms-trash/*/manifest.json' ) );
-check( 'index row removed', 0 === (int) $wpdb->get_var( "SELECT COUNT(*) FROM {$images} WHERE id = {$img3_id}" ) );
+
+$row = $wpdb->get_row( "SELECT status FROM {$images} WHERE id = {$img3_id}", ARRAY_A );
+check( 'index row kept with status=trash', $row && 'trash' === $row['status'] );
 
 $trash_entries = MSW_Cleaner::list_trash();
 check( 'trash listing shows entry', 1 === count( $trash_entries ) );
@@ -159,6 +161,13 @@ check( 'trash restore succeeded', ! is_wp_error( $restored ), is_wp_error( $rest
 check( 'file back in uploads', is_file( $basedir . '/2026/09/test3.png' ) );
 $att6 = get_post( 6 );
 check( 'attachment 6 untrashed', $att6 && 'trash' !== $att6->post_status );
+
+$row = $wpdb->get_row( "SELECT status FROM {$images} WHERE id = {$img3_id}", ARRAY_A );
+check( 'index row back to active after restore', $row && 'active' === $row['status'] );
+
+// file_mtime recorded by the scanner.
+$stale = (int) $wpdb->get_var( "SELECT COUNT(*) FROM {$images} WHERE file_mtime = 0" );
+check( 'file_mtime recorded for every file', 0 === $stale, "missing={$stale}" );
 
 // --- 5. Duplicate detection (identical md5) -------------------------------------
 $copy = $basedir . '/2026/09/test2-copy.jpg';

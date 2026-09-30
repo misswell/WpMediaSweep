@@ -57,9 +57,18 @@ class MSW_Cleaner {
 
 			$summary['trashed']++;
 
-			// Remove from index: the file no longer lives in uploads.
-			$wpdb->delete( MSW_Database::table( MSW_Database::IMAGES ), array( 'id' => $image_id ), array( '%d' ) );
-			$wpdb->delete( MSW_Database::table( MSW_Database::REFERENCES ), array( 'image_id' => $image_id ), array( '%d' ) );
+			// Keep the index row with a lifecycle status; the manifest holds the
+			// file truth. Restore flips the status back to active.
+			$wpdb->update(
+				MSW_Database::table( MSW_Database::IMAGES ),
+				array(
+					'status'     => 'trash',
+					'updated_at' => current_time( 'mysql', true ),
+				),
+				array( 'id' => $image_id ),
+				array( '%s', '%s' ),
+				array( '%d' )
+			);
 
 			MSW_Logger::info( 'cleanup', sprintf( 'Trashed %s (image #%d).', $image['file_name'], $image_id ) );
 		}
@@ -78,6 +87,9 @@ class MSW_Cleaner {
 		if ( ! is_file( $path ) ) {
 			return new WP_Error( 'msw_cleanup', 'File not found on disk.' );
 		}
+		if ( ! MSW_Files::within_uploads( $path ) ) {
+			return new WP_Error( 'msw_cleanup', 'Refusing to move a file outside the uploads directory.' );
+		}
 
 		$uploads_root = MSW_Scanner::uploads_basedir();
 		$rel          = $image['file_rel_path'];
@@ -91,6 +103,7 @@ class MSW_Cleaner {
 		}
 
 		$manifest = array(
+			'image_id'      => (int) $image['id'],
 			'attachment_id' => (int) $image['attachment_id'],
 			'rel_path'      => $rel,
 			'trashed_at'    => current_time( 'mysql', true ),
@@ -179,6 +192,21 @@ class MSW_Cleaner {
 			}
 		}
 
+		// Flip the index row back to active.
+		if ( ! empty( $manifest['image_id'] ) ) {
+			global $wpdb;
+			$wpdb->update(
+				MSW_Database::table( MSW_Database::IMAGES ),
+				array(
+					'status'     => 'active',
+					'updated_at' => current_time( 'mysql', true ),
+				),
+				array( 'id' => (int) $manifest['image_id'] ),
+				array( '%s', '%s' ),
+				array( '%d' )
+			);
+		}
+
 		// Re-index the restored file on the next scan; log it.
 		MSW_Logger::info( 'cleanup', sprintf( 'Restored %s from trash (token %s).', $manifest['rel_path'], $token ) );
 
@@ -224,7 +252,7 @@ class MSW_Cleaner {
 				}
 
 				$mtime = @filemtime( $backup );
-				if ( $mtime && $mtime < $cutoff ) {
+				if ( $mtime && $mtime < $cutoff && MSW_Files::within_uploads( $backup ) ) {
 					if ( @unlink( $backup ) ) {
 						$purged++;
 						MSW_Logger::info( 'cleanup', sprintf( 'Removed expired backup for %s (retention %d days).', $row['file_name'], $retention ) );
@@ -297,6 +325,22 @@ class MSW_Cleaner {
 				if ( $attachment ) {
 					wp_delete_post( (int) $entry['attachment_id'], true );
 				}
+			}
+
+			// Drop the trashed index rows for good (originals + their size variants).
+			if ( ! empty( $entry['image_id'] ) ) {
+				$wpdb->query(
+					$wpdb->prepare(
+						'DELETE FROM ' . MSW_Database::table( MSW_Database::IMAGES ) . ' WHERE id = %d OR parent_file_id = %d', // phpcs:ignore
+						(int) $entry['image_id'],
+						(int) $entry['image_id']
+					)
+				);
+				$wpdb->delete(
+					MSW_Database::table( MSW_Database::REFERENCES ),
+					array( 'image_id' => (int) $entry['image_id'] ),
+					array( '%d' )
+				);
 			}
 
 			// Remove files.

@@ -19,7 +19,7 @@ class MSW_Rest_Images {
 		global $wpdb;
 
 		$table   = MSW_Database::table( MSW_Database::IMAGES );
-		$where   = array( '1=1' );
+		$where   = array( "status = 'active'" );
 		$prepare = array();
 
 		$status = $request->get_param( 'status' );
@@ -260,6 +260,10 @@ class MSW_Rest_Images {
 				return sprintf( 'WooCommerce gallery of product #%d', $ref['reference_id'] );
 			case 'elementor':
 				return sprintf( 'Elementor page #%d', $ref['reference_id'] );
+			case 'theme_maybe':
+				return 'Theme file (name match): ' . $ref['source'];
+			case 'plugin_maybe':
+				return 'Plugin file (name match): ' . $ref['source'];
 			case 'theme':
 				return 'Theme file: ' . $ref['source'];
 			case 'plugin':

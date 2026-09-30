@@ -72,7 +72,7 @@ class MSW_CLI {
 	 * [--id=<id>]
 	 * : Compress one indexed image synchronously.
 	 *
-	 * [--ids=<id,id,…>]
+	 * [--ids=<id,id,...>]
 	 * : Queue a batch task for specific image ids.
 	 *
 	 * [--all]
@@ -81,18 +81,30 @@ class MSW_CLI {
 	 * [--force]
 	 * : With --id, recompress even if already compressed.
 	 *
+	 * [--dry-run]
+	 * : Show the estimated savings without compressing anything.
+	 *
 	 * [--max-steps=<n>]
 	 * : Safety stop after n task steps. Default: unlimited.
 	 *
 	 * ## EXAMPLES
 	 *
 	 *     wp mediasweep compress --id=42
-	 *     wp mediasweep compress --all
+	 *     wp mediasweep compress --all --dry-run
 	 *
 	 * @param array $args       Positional args.
 	 * @param array $assoc_args Flags.
 	 */
 	public function compress( $args, $assoc_args ) {
+		if ( ! empty( $assoc_args['dry-run'] ) ) {
+			$response = MSW_Plugin::rest_estimate();
+			$data     = $response->get_data();
+			WP_CLI::log( sprintf( 'Pending images: %d (%s)', $data['pending_count'], size_format( $data['pending_bytes'] ) ) );
+			WP_CLI::log( sprintf( 'Estimated savings: %s (based on %s average ratio of %.1f%%)', size_format( $data['estimated_savings'] ), $data['basis'], $data['estimated_ratio'] ) );
+			WP_CLI::success( 'Dry run — nothing was modified.' );
+			return;
+		}
+
 		if ( ! empty( $assoc_args['id'] ) ) {
 			$result = MSW_Compressor::compress_image( (int) $assoc_args['id'], ! empty( $assoc_args['force'] ) );
 			if ( is_wp_error( $result ) ) {
@@ -185,7 +197,7 @@ class MSW_CLI {
 	 *
 	 * ## OPTIONS
 	 *
-	 * [--ids=<id,id,…>]
+	 * [--ids=<id,id,...>]
 	 * : Index ids to trash.
 	 *
 	 * [--unused]
@@ -247,6 +259,82 @@ class MSW_CLI {
 				? sprintf( 'Ran one step; task #%d still %s.', $task ? $task['id'] : 0, $task ? $task['status'] : 'done' )
 				: 'No active task.'
 		);
+	}
+
+	/**
+	 * Environment health check: PHP, image backends, permissions, schema, cron.
+	 *
+	 * ## EXAMPLES
+	 *
+	 *     wp mediasweep doctor
+	 *
+	 * @param array $args       Positional args.
+	 * @param array $assoc_args Flags.
+	 */
+	public function doctor( $args, $assoc_args ) {
+		global $wpdb;
+
+		$checks = array();
+		$fails  = 0;
+
+		$php = PHP_VERSION;
+		$checks[] = array( 'check' => 'PHP version', 'result' => $php, 'ok' => version_compare( $php, '7.4', '>=' ) );
+
+		$gd = MSW_Backend_GD::available();
+		$checks[] = array( 'check' => 'GD backend', 'result' => $gd ? ( function_exists( 'imageavif' ) ? 'yes (incl. AVIF)' : 'yes' ) : 'no', 'ok' => $gd );
+
+		$imagick = MSW_Backend_Imagick::available();
+		$checks[] = array( 'check' => 'Imagick backend', 'result' => $imagick ? 'yes' : 'no', 'ok' => true ); // Optional.
+
+		$checks[] = array( 'check' => 'Compression backend', 'result' => ( $imagick || $gd ) ? 'available' : 'NONE', 'ok' => ( $imagick || $gd ) );
+
+		$uploads = wp_get_upload_dir();
+		$writable = isset( $uploads['basedir'] ) && is_dir( $uploads['basedir'] ) && is_writable( $uploads['basedir'] );
+		$checks[] = array( 'check' => 'Uploads directory writable', 'result' => $uploads['basedir'], 'ok' => $writable );
+
+		$disk = @disk_free_space( $uploads['basedir'] );
+		if ( false !== $disk ) {
+			$checks[] = array( 'check' => 'Free disk space', 'result' => size_format( $disk ), 'ok' => $disk > 100 * MB_IN_BYTES );
+		}
+
+		$required_tables = array( 'ms_images', 'ms_references', 'ms_tasks', 'ms_logs' );
+		$existing = array();
+		foreach ( $required_tables as $short ) {
+			$name   = $wpdb->prefix . $short;
+			$exists = strtolower( (string) $wpdb->get_var( $wpdb->prepare( 'SHOW TABLES LIKE %s', $name ) ) ) === strtolower( $name );
+			$existing[ $short ] = $exists;
+			if ( ! $exists ) {
+				$fails++;
+			}
+		}
+		$checks[] = array(
+			'check' => 'Database tables',
+			'result' => implode( ', ', array_map( function ( $t ) use ( $existing ) { return $t . ( $existing[ $t ] ? '✓' : '✗' ); }, $required_tables ) ),
+			'ok'     => ! in_array( false, $existing, true ),
+		);
+
+		$cols = $wpdb->get_col( 'SHOW COLUMNS FROM ' . $wpdb->prefix . 'ms_images' );
+		$has_new_cols = in_array( 'status', $cols, true ) && in_array( 'md5_hash', $cols, true );
+		$checks[] = array( 'check' => 'Schema version', 'result' => $has_new_cols ? 'v3' : 'outdated', 'ok' => $has_new_cols );
+
+		$cron_tick = wp_next_scheduled( MSW_Cron::TICK_HOOK );
+		$checks[] = array( 'check' => 'Task ticker scheduled', 'result' => $cron_tick ? 'yes' : 'no', 'ok' => (bool) $cron_tick );
+
+		$checks[] = array( 'check' => 'WP-Cron disabled', 'result' => defined( 'DISABLE_WP_CRON' ) && DISABLE_WP_CRON ? 'yes (use `wp mediasweep tick` externally)' : 'no', 'ok' => true );
+
+		foreach ( $checks as $check ) {
+			if ( ! $check['ok'] ) {
+				$fails++;
+			}
+		}
+
+		WP_CLI\Utils\format_items( 'table', $checks, array( 'check', 'result' ) );
+
+		if ( $fails > 0 ) {
+			WP_CLI::warning( sprintf( '%d check(s) failed.', $fails ) );
+		} else {
+			WP_CLI::success( 'All checks passed.' );
+		}
 	}
 
 	/**

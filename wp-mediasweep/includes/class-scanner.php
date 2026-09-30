@@ -272,11 +272,13 @@ class MSW_Scanner {
 				'width'         => is_array( $info ) ? (int) $info[0] : 0,
 				'height'        => is_array( $info ) ? (int) $info[1] : 0,
 				'file_size'     => $size ? (int) $size : 0,
+				'file_mtime'    => @filemtime( $path ) ?: 0,
 				'md5_hash'      => $size ? md5_file( $path ) : '',
 				'is_thumbnail'  => (int) $item['thumb'],
+				'status'        => 'active',
 				'updated_at'    => $now,
 			);
-			$format = array( '%s', '%s', '%s', '%s', '%d', '%d', '%d', '%s', '%d', '%s' );
+			$format = array( '%s', '%s', '%s', '%s', '%d', '%d', '%d', '%d', '%s', '%d', '%s', '%s' );
 
 			if ( isset( $existing[ $rel ] ) ) {
 				$wpdb->update( $table, $data, array( 'file_rel_path' => $rel ), $format, array( '%s' ) );

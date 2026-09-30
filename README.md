@@ -18,11 +18,12 @@ for WordPress media libraries*.
 | **Media scan** | Indexes every image under `wp-content/uploads` (jpg / jpeg / png / webp / avif) in resumable batches, including WordPress `-WxH` size variants linked to their parent; md5 hash computed for every file |
 | **Compression** | Octo Engine (PHP port of the OctoShrink strategy): Imagick → GD backend chain, per-format quality (JPEG 85 / PNG lossless / WebP 80 / AVIF 65) |
 | **Safety** | Backup → compress → validate → replace. Originals kept as `.ms-original`, one-click restore, "no improvement → keep original" rule, configurable backup retention with daily cleanup |
-| **Reference analysis** | Detects where each image is used: post content, featured images, Gutenberg blocks, WooCommerce galleries, Elementor data, theme/plugin files |
+| **Reference analysis** | Detects where each image is used: post content, featured images, **Gutenberg blocks via native `parse_blocks()`** (any block type, incl. galleries), WooCommerce galleries, **Elementor JSON (attachment ids *and* image URLs)**, theme/plugin files. Code references count as strong, docs/README mentions only as weak "maybe" hits — and a reference found on a size-variant URL is attributed to its parent original |
 | **Risk grading** | Every candidate graded: *safe* (no media library record) / *delete with care* (attachment exists, no references) / *do not delete* (referenced) |
 | **Duplicate detection** | md5 grouping across original images — shows identical copies and reclaimable space |
-| **Cleanup** | Unused candidates → your confirmation → trash (files moved to `uploads/ms-trash` with manifest + WP native attachment trash) → auto purge after 30 days |
-| **WP-CLI** | `wp mediasweep scan / references / compress / unused / clean / duplicates / stats / tick` for large sites |
+| **Cleanup** | Unused candidates → your confirmation → trash (files moved to `uploads/ms-trash` with manifest + WP native attachment trash; index rows keep a lifecycle status) → auto purge after 30 days. Every file write is guard-checked to stay inside `uploads` |
+| **WP-CLI** | `wp mediasweep scan / references / compress / unused / clean / duplicates / doctor / stats / tick` for large sites |
+| **Auto-optimize** | Optional on-upload compression via `wp_generate_attachment_metadata` (`auto_compress` setting) |
 
 ## Installation
 
