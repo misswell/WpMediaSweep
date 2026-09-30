@@ -1,0 +1,10 @@
+# Build tooling
+node_modules/
+frontend-src/
+
+# macOS
+.DS_Store
+
+# Project scratch
+.mimosa/
+*.zip
