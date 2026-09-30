@@ -78,7 +78,7 @@ class MSW_Octo_Engine {
 		// Output temp file must live in the same directory (rename() is not cross-device).
 		$dir        = dirname( $path );
 		$ext        = pathinfo( $path, PATHINFO_EXTENSION );
-		$tmp_target = $dir . '/.' . basename( $path, '.' . $ext ) . '.ms-tmp.' . $ext;
+		$tmp_target = $dir . '/.ms-tmp-' . bin2hex( random_bytes( 8 ) ) . '.' . $ext;
 
 		$chain = self::backend_chain( $mime, $options );
 		$error = 'No compression backend available for ' . $mime . '.';

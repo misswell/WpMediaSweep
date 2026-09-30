@@ -3,7 +3,7 @@
  * Plugin Name:       MediaSweep
  * Plugin URI:        https://github.com/misswell/WpMediaSweep
  * Description:       A local-first WordPress media optimization and cleanup tool. Scan, compress, analyze references and safely clean up unused media — all processed locally, never uploaded to third parties.
- * Version:           0.3.3
+ * Version:           0.3.4
  * Requires at least: 5.8
  * Requires PHP:      7.4
  * Author:            misswell
@@ -16,7 +16,7 @@
 
 defined( 'ABSPATH' ) || exit;
 
-define( 'MSW_VERSION', '0.3.3' );
+define( 'MSW_VERSION', '0.3.4' );
 define( 'MSW_PLUGIN_FILE', __FILE__ );
 define( 'MSW_PLUGIN_DIR', plugin_dir_path( __FILE__ ) );
 define( 'MSW_PLUGIN_URL', plugin_dir_url( __FILE__ ) );

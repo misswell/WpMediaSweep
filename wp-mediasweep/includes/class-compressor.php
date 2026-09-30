@@ -33,6 +33,12 @@ class MSW_Compressor {
 	 * @return array|WP_Error Result summary.
 	 */
 	public static function compress_image( $image_id, $force = false ) {
+		return MSW_Files::with_lock( 'image-' . (int) $image_id, function () use ( $image_id, $force ) {
+			return self::compress_image_locked( $image_id, $force );
+		} );
+	}
+
+	protected static function compress_image_locked( $image_id, $force ) {
 		global $wpdb;
 
 		$image = self::get_image( $image_id );
@@ -67,11 +73,17 @@ class MSW_Compressor {
 
 		// 1. Backup (restore point until the engine result is accepted).
 		$backup = $path . self::BACKUP_SUFFIX;
-		$backed_up = false;
 		if ( MSW_Settings::get( 'keep_originals', true ) ) {
-			$backed_up = @copy( $path, $backup );
-			if ( ! $backed_up ) {
-				return new WP_Error( 'msw_compress', 'Cannot create backup file.' );
+			if ( ! MSW_Files::within_uploads( $backup ) || is_link( $backup ) ) {
+				return new WP_Error( 'msw_compress', 'Unsafe backup path; compression aborted.' );
+			}
+			if ( file_exists( $backup ) ) {
+				if ( ! is_file( $backup ) || ! is_readable( $backup ) || filesize( $backup ) <= 0 ) {
+					return new WP_Error( 'msw_compress', 'Existing backup is unreadable or empty: ' . $backup );
+				}
+			} elseif ( ! @copy( $path, $backup ) ) {
+				@unlink( $backup );
+				return new WP_Error( 'msw_compress', 'Cannot create backup file. Check directory permissions and available disk space: ' . $backup );
 			}
 		}
 
@@ -100,6 +112,7 @@ class MSW_Compressor {
 			MSW_Logger::error( 'compress', sprintf( 'Cannot replace file for #%d.', $image_id ) );
 			return new WP_Error( 'msw_compress', 'Cannot replace original file.' );
 		}
+		clearstatcache( true, $path );
 		@chmod( $path, fileperms( $path ) & 0666 | 0644 );
 
 		// 4. Bookkeeping.
@@ -152,6 +165,12 @@ class MSW_Compressor {
 	 * @return true|WP_Error
 	 */
 	public static function restore_image( $image_id ) {
+		return MSW_Files::with_lock( 'image-' . (int) $image_id, function () use ( $image_id ) {
+			return self::restore_image_locked( $image_id );
+		} );
+	}
+
+	protected static function restore_image_locked( $image_id ) {
 		global $wpdb;
 
 		$image = self::get_image( $image_id );
@@ -160,17 +179,25 @@ class MSW_Compressor {
 		}
 
 		$backup = $image['file_path'] . self::BACKUP_SUFFIX;
-		if ( ! MSW_Files::within_uploads( $backup ) ) {
+		if ( ! MSW_Files::within_uploads( $backup ) || ! MSW_Files::within_uploads( $image['file_path'] ) ) {
 			return new WP_Error( 'msw_restore', 'Refusing to touch a file outside the uploads directory.' );
 		}
 		if ( ! is_file( $backup ) ) {
 			return new WP_Error( 'msw_restore', 'No backup file found.' );
 		}
-
-		if ( ! @copy( $backup, $image['file_path'] ) ) {
+		$target = $image['file_path'];
+		$tmp = dirname( $target ) . '/.ms-restore-' . uniqid( '', true );
+		if ( ! MSW_Files::within_uploads( $tmp ) || ! @copy( $backup, $tmp ) ) {
+			@unlink( $tmp );
 			return new WP_Error( 'msw_restore', 'Cannot restore original file.' );
 		}
+		if ( ! @rename( $tmp, $target ) ) {
+			@unlink( $tmp );
+			return new WP_Error( 'msw_restore', 'Cannot replace file during restore; backup retained.' );
+		}
+		@chmod( $target, 0644 );
 		@unlink( $backup );
+		clearstatcache( true, $target );
 
 		$size = (int) filesize( $image['file_path'] );
 		$wpdb->update(
@@ -206,7 +233,7 @@ class MSW_Compressor {
 
 		$cursor = wp_parse_args(
 			is_array( $task['cursor'] ) ? $task['cursor'] : array(),
-			array( 'last_id' => 0, 'processed' => 0, 'failed' => 0, 'saved' => 0 )
+			array( 'last_id' => 0, 'selection_offset' => 0, 'processed' => 0, 'failed' => 0, 'saved' => 0 )
 		);
 
 		$table = MSW_Database::table( MSW_Database::IMAGES );
@@ -218,6 +245,9 @@ class MSW_Compressor {
 		$selected = isset( $task['options']['ids'] ) && is_array( $task['options']['ids'] )
 			? array_map( 'intval', $task['options']['ids'] )
 			: null;
+		if ( null !== $selected ) {
+			$selected = array_slice( $selected, (int) $cursor['selection_offset'] );
+		}
 
 		while ( microtime( true ) - $start < $budget ) {
 			if ( null !== $selected ) {
@@ -238,6 +268,11 @@ class MSW_Compressor {
 			}
 
 			if ( ! $rows ) {
+				if ( null !== $selected ) {
+					$cursor['selection_offset'] += count( $ids );
+					MSW_Task_Manager::set_cursor( $task['id'], $cursor );
+					continue;
+				}
 				break;
 			}
 
@@ -264,6 +299,10 @@ class MSW_Compressor {
 						'failed'    => $cursor['failed'],
 					)
 				);
+				MSW_Task_Manager::set_cursor( $task['id'], $cursor );
+			}
+			if ( null !== $selected ) {
+				$cursor['selection_offset'] += count( $ids );
 				MSW_Task_Manager::set_cursor( $task['id'], $cursor );
 			}
 

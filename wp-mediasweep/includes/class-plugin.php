@@ -250,6 +250,9 @@ class MSW_Plugin {
 		$id    = (int) $wpdb->get_var(
 			$wpdb->prepare( "SELECT id FROM {$table} WHERE file_rel_path = %s AND is_thumbnail = 0", $rel )
 		);
+		if ( ! $id ) {
+			$id = MSW_Scanner::index_attachment( $attachment_id, $rel );
+		}
 
 		if ( $id ) {
 			$result = MSW_Compressor::compress_image( $id );

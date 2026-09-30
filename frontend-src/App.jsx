@@ -4,13 +4,15 @@ const { __ } = wp.i18n;
 import Dashboard from './pages/Dashboard';
 import Images from './pages/Images';
 import Unused from './pages/Unused';
+import Trash from './pages/Trash';
 import Tasks from './pages/Tasks';
 import Settings from './pages/Settings';
 
 const TABS = [
 	{ key: 'dashboard', label: __( 'Dashboard', 'mediasweep' ) },
 	{ key: 'images', label: __( 'Images', 'mediasweep' ) },
-	{ key: 'unused', label: __( 'Unused & Trash', 'mediasweep' ) },
+	{ key: 'unused', label: __( 'Unused', 'mediasweep' ) },
+	{ key: 'trash', label: __( 'Trash', 'mediasweep' ) },
 	{ key: 'tasks', label: __( 'Tasks', 'mediasweep' ) },
 	{ key: 'settings', label: __( 'Settings', 'mediasweep' ) },
 ];
@@ -28,6 +30,7 @@ export default function App() {
 	const Page =
 		tab === 'images' ? Images
 		: tab === 'unused' ? Unused
+		: tab === 'trash' ? Trash
 		: tab === 'tasks' ? Tasks
 		: tab === 'settings' ? Settings
 		: Dashboard;

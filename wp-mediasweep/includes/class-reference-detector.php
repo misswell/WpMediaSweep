@@ -252,6 +252,9 @@ class MSW_Reference_Detector {
 			);
 
 			$targets = array();
+			if ( isset( $cursor['pending_refs'] ) && $wpdb->last_error ) {
+				throw new RuntimeException( 'Image reference lookup failed.' );
+			}
 			foreach ( (array) $found as $hit ) {
 				$targets[] = $hit['parent_file_id'] > 0 ? (int) $hit['parent_file_id'] : (int) $hit['id'];
 			}
@@ -275,6 +278,9 @@ class MSW_Reference_Detector {
 					ARRAY_A
 				);
 				$targets = array();
+				if ( isset( $cursor['pending_refs'] ) && $wpdb->last_error ) {
+					throw new RuntimeException( 'Block reference lookup failed.' );
+				}
 				foreach ( (array) $found as $hit ) {
 					$targets[] = $hit['parent_file_id'] > 0 ? (int) $hit['parent_file_id'] : (int) $hit['id'];
 				}
@@ -296,6 +302,9 @@ class MSW_Reference_Detector {
 					),
 					ARRAY_A
 				);
+				if ( isset( $cursor['pending_refs'] ) && $wpdb->last_error ) {
+					throw new RuntimeException( 'Filename reference lookup failed.' );
+				}
 				foreach ( (array) $found as $hit ) {
 					$target_id = $hit['parent_file_id'] > 0 ? (int) $hit['parent_file_id'] : (int) $hit['id'];
 					self::store_ref( $target_id, $maybe_type, $ref_id, $source, $cursor );
@@ -613,12 +622,12 @@ class MSW_Reference_Detector {
 		foreach ( $rows as $row ) {
 			$cursor['last_id'] = (int) $row['id'];
 
-			if ( 0 === (int) $row['attachment_id'] ) {
-				$status = self::STATUS_ORPHAN;
-			} elseif ( (int) $row['hard'] > 0 ) {
+			if ( (int) $row['hard'] > 0 ) {
 				$status = self::STATUS_USED;
 			} elseif ( (int) $row['soft'] > 0 ) {
 				$status = self::STATUS_MAYBE;
+			} elseif ( 0 === (int) $row['attachment_id'] ) {
+				$status = self::STATUS_ORPHAN;
 			} else {
 				$status = self::STATUS_UNUSED;
 			}
@@ -651,7 +660,16 @@ class MSW_Reference_Detector {
 	protected static function store_ref( $image_id, $type, $ref_id, $source, &$cursor ) {
 		global $wpdb;
 
-		if ( ! $image_id ) {
+		if ( ! $image_id || ( isset( $cursor['only_image_id'] ) && (int) $image_id !== (int) $cursor['only_image_id'] ) ) {
+			return;
+		}
+		if ( isset( $cursor['pending_refs'] ) ) {
+			$key = md5( $type . ':' . $ref_id . ':' . $source );
+			$cursor['pending_refs'][ $key ] = array(
+				'image_id' => (int) $image_id, 'reference_type' => $type,
+				'reference_id' => (int) $ref_id, 'source' => $source,
+				'created_at' => current_time( 'mysql', true ),
+			);
 			return;
 		}
 
@@ -693,6 +711,18 @@ class MSW_Reference_Detector {
 	 * @return array|WP_Error Updated row + references.
 	 */
 	public static function analyze_image( $image_id ) {
+		return MSW_Files::with_lock( 'task-tick', function () use ( $image_id ) {
+			try {
+				return self::analyze_image_locked( $image_id );
+			} catch ( Throwable $error ) {
+				global $wpdb;
+				$wpdb->query( 'ROLLBACK' );
+				return new WP_Error( 'msw_refs', 'Reference analysis failed; previous references retained.' );
+			}
+		} );
+	}
+
+	protected static function analyze_image_locked( $image_id ) {
 		global $wpdb;
 
 		$image = $wpdb->get_row(
@@ -704,98 +734,110 @@ class MSW_Reference_Detector {
 		}
 
 		$refs_table = MSW_Database::table( MSW_Database::REFERENCES );
-		$wpdb->delete( $refs_table, array( 'image_id' => $image_id ), array( '%d' ) );
-
-		$cursor = array( 'found' => 0 );
+		$cursor = array( 'found' => 0, 'only_image_id' => (int) $image_id, 'pending_refs' => array() );
 		$att_id = (int) $image['attachment_id'];
 		$rel    = $image['file_rel_path'];
 		$name   = $image['file_name'];
 
-		if ( $att_id ) {
-			// post_content: exact rel path, then bare name.
-			$like_exact = '%' . $wpdb->esc_like( $rel ) . '%';
+		// The filename stem also selects size-variant URLs; numeric candidates
+		// allow native block parsing to find ID-only Gutenberg references.
+		$stem_like = '%' . $wpdb->esc_like( pathinfo( $name, PATHINFO_FILENAME ) ) . '%';
+		$id_like = '%' . $wpdb->esc_like( (string) $att_id ) . '%';
+		$last = 0;
+		do {
 			$posts = $wpdb->get_results(
 				$wpdb->prepare(
-					"SELECT ID, post_title, post_content FROM {$wpdb->posts} WHERE post_content LIKE %s AND post_status NOT IN ('trash','auto-draft') LIMIT 50",
-					$like_exact
+					"SELECT ID, post_title, post_content FROM {$wpdb->posts} WHERE ID > %d AND (post_content LIKE %s OR post_content LIKE %s) AND post_status NOT IN ('trash','auto-draft') ORDER BY ID ASC LIMIT 100",
+					$last, $stem_like, $id_like
 				),
 				ARRAY_A
 			);
+			if ( null === $posts || $wpdb->last_error ) {
+				return new WP_Error( 'msw_refs', 'Reference query failed; previous references retained.' );
+			}
 			foreach ( (array) $posts as $post ) {
-				self::store_ref( $image_id, 'post_content', (int) $post['ID'], $post['post_title'], $cursor );
-				if ( false !== strpos( $post['post_content'], '<!-- wp:' )
-					&& ( preg_match( '/"id":\s*' . $att_id . '\b/', $post['post_content'] )
-						|| preg_match( '/\bid=["\']' . $att_id . '["\']/', $post['post_content'] ) ) ) {
-					self::store_ref( $image_id, 'gutenberg', (int) $post['ID'], $post['post_title'], $cursor );
-				}
+				self::find_refs_in_content( $post['post_content'], 'post_content', (int) $post['ID'], $post['post_title'], $cursor );
+				$last = (int) $post['ID'];
 			}
+		} while ( count( $posts ) === 100 );
 
-			// Featured image.
-			$featured = $wpdb->get_col(
-				$wpdb->prepare( "SELECT post_id FROM {$wpdb->postmeta} WHERE meta_key = '_thumbnail_id' AND meta_value = %s LIMIT 100", (string) $att_id )
-			);
-			foreach ( (array) $featured as $post_id ) {
-				self::store_ref( $image_id, 'featured', (int) $post_id, '_thumbnail_id', $cursor );
-			}
-
-			// WooCommerce gallery.
-			$galleries = $wpdb->get_results(
-				$wpdb->prepare( "SELECT post_id, meta_value FROM {$wpdb->postmeta} WHERE meta_key = '_product_image_gallery' AND FIND_IN_SET( %d, meta_value ) LIMIT 100", $att_id ),
-				ARRAY_A
-			);
-			foreach ( (array) $galleries as $row ) {
-				self::store_ref( $image_id, 'woocommerce', (int) $row['post_id'], '_product_image_gallery', $cursor );
-			}
-
-			// Elementor.
-			$elementor = $wpdb->get_results(
+		$last = 0;
+		do {
+			$meta = $wpdb->get_results(
 				$wpdb->prepare(
-					"SELECT post_id, meta_value FROM {$wpdb->postmeta} WHERE meta_key = '_elementor_data' AND ( meta_value LIKE %s OR meta_value LIKE %s ) LIMIT 50",
-					'%' . $wpdb->esc_like( $rel ) . '%',
-					'%' . $wpdb->esc_like( $name ) . '%'
+					"SELECT meta_id, post_id, meta_key, meta_value FROM {$wpdb->postmeta} WHERE meta_id > %d AND ((meta_key = '_thumbnail_id' AND meta_value = %s) OR (meta_key = '_product_image_gallery' AND FIND_IN_SET(%d, meta_value)) OR (meta_key = '_elementor_data' AND (meta_value LIKE %s OR meta_value LIKE %s))) ORDER BY meta_id ASC LIMIT 100",
+					$last, (string) $att_id, $att_id, $stem_like, $id_like
 				),
 				ARRAY_A
 			);
-			foreach ( (array) $elementor as $row ) {
+			if ( null === $meta || $wpdb->last_error ) {
+				return new WP_Error( 'msw_refs', 'Reference query failed; previous references retained.' );
+			}
+			foreach ( (array) $meta as $row ) {
+				$last = (int) $row['meta_id'];
+				if ( '_elementor_data' !== $row['meta_key'] ) {
+					if ( $att_id > 0 ) {
+						$type = '_thumbnail_id' === $row['meta_key'] ? 'featured' : 'woocommerce';
+						self::store_ref( $image_id, $type, (int) $row['post_id'], $row['meta_key'], $cursor );
+					}
+					continue;
+				}
 				$ids = array();
 				$urls = array();
 				$data = json_decode( (string) $row['meta_value'], true );
 				if ( is_array( $data ) ) {
 					self::collect_media_refs_recursive( $data, $ids, $urls );
 				}
-				if ( in_array( $att_id, $ids, true ) || false !== strpos( (string) $row['meta_value'], $rel ) ) {
+				if ( $att_id > 0 && in_array( $att_id, $ids, true ) ) {
 					self::store_ref( $image_id, 'elementor', (int) $row['post_id'], '_elementor_data', $cursor );
 				}
+				foreach ( $urls as $url ) {
+					self::find_refs_in_content( $url, 'elementor', (int) $row['post_id'], '_elementor_data', $cursor );
+				}
 			}
+		} while ( count( $meta ) === 100 );
 
-			// Bare-name fuzzy hits (maybe).
-			$fuzzy = $wpdb->get_results(
-				$wpdb->prepare(
-					"SELECT ID, post_title FROM {$wpdb->posts} WHERE post_content LIKE %s AND post_content NOT LIKE %s AND post_status NOT IN ('trash','auto-draft') LIMIT 50",
-					'%' . $wpdb->esc_like( $name ) . '%',
-					$like_exact
-				),
-				ARRAY_A
-			);
-			foreach ( (array) $fuzzy as $post ) {
-				self::store_ref( $image_id, 'post_content_maybe', (int) $post['ID'], $post['post_title'], $cursor );
+		// Replace only the sources actually rechecked. Theme/plugin hits survive
+		// until a full scan. Commit the new set together, after all reads succeeded.
+		if ( false === $wpdb->query( 'START TRANSACTION' ) ) {
+			return new WP_Error( 'msw_refs', 'Cannot begin reference update.' );
+		}
+		$deleted = $wpdb->query( $wpdb->prepare(
+			"DELETE FROM {$refs_table} WHERE image_id = %d AND reference_type IN ('post_content','post_content_maybe','gutenberg','featured','woocommerce','elementor')", $image_id
+		) );
+		if ( false === $deleted ) {
+			$wpdb->query( 'ROLLBACK' );
+			return new WP_Error( 'msw_refs', 'Cannot update references.' );
+		}
+		foreach ( $cursor['pending_refs'] as $ref ) {
+			if ( false === $wpdb->insert( $refs_table, $ref, array( '%d', '%s', '%d', '%s', '%s' ) ) ) {
+				$wpdb->query( 'ROLLBACK' );
+				return new WP_Error( 'msw_refs', 'Cannot save references; previous references retained.' );
 			}
 		}
 
 		// Re-aggregate status for this row.
 		$hard = (int) $wpdb->get_var( $wpdb->prepare( "SELECT COUNT(*) FROM {$refs_table} WHERE image_id = %d AND reference_type NOT IN ('post_content_maybe','theme_maybe','plugin_maybe')", $image_id ) );
+		if ( $wpdb->last_error ) {
+			$wpdb->query( 'ROLLBACK' );
+			return new WP_Error( 'msw_refs', 'Cannot count references.' );
+		}
 		$soft = (int) $wpdb->get_var( $wpdb->prepare( "SELECT COUNT(*) FROM {$refs_table} WHERE image_id = %d AND reference_type IN ('post_content_maybe','theme_maybe','plugin_maybe')", $image_id ) );
+		if ( $wpdb->last_error ) {
+			$wpdb->query( 'ROLLBACK' );
+			return new WP_Error( 'msw_refs', 'Cannot count references.' );
+		}
 
 		$status = self::STATUS_UNUSED;
-		if ( 0 === $att_id ) {
-			$status = self::STATUS_ORPHAN;
-		} elseif ( $hard > 0 ) {
+		if ( $hard > 0 ) {
 			$status = self::STATUS_USED;
 		} elseif ( $soft > 0 ) {
 			$status = self::STATUS_MAYBE;
+		} elseif ( 0 === $att_id ) {
+			$status = self::STATUS_ORPHAN;
 		}
 
-		$wpdb->update(
+		$updated = $wpdb->update(
 			MSW_Database::table( MSW_Database::IMAGES ),
 			array(
 				'reference_status' => $status,
@@ -806,6 +848,10 @@ class MSW_Reference_Detector {
 			array( '%s', '%d', '%s' ),
 			array( '%d' )
 		);
+		if ( false === $updated || false === $wpdb->query( 'COMMIT' ) ) {
+			$wpdb->query( 'ROLLBACK' );
+			return new WP_Error( 'msw_refs', 'Cannot finalize reference update.' );
+		}
 
 		$references = $wpdb->get_results(
 			$wpdb->prepare( "SELECT * FROM {$refs_table} WHERE image_id = %d ORDER BY reference_type, id", $image_id ),
@@ -813,9 +859,11 @@ class MSW_Reference_Detector {
 		);
 
 		// Attach human labels.
-		foreach ( (array) $references as &$ref ) {
+		$references = (array) $references;
+		foreach ( $references as &$ref ) {
 			$ref['label'] = self::reference_label( $ref );
 		}
+		unset( $ref );
 
 		return array(
 			'image'      => $image,

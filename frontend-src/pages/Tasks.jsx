@@ -10,8 +10,8 @@ import { TASK_TYPE_LABELS } from '../format';
 export default function Tasks() {
 	const [ tasks, setTasks ] = useState( null );
 	const [ busy, setBusy ] = useState( false );
-	const [ ticking, setTicking ] = useState( false );
 	const timerRef = useRef( null );
+	const tickingRef = useRef( false );
 
 	const load = async () => {
 		try {
@@ -30,18 +30,18 @@ export default function Tasks() {
 
 	// Drive the task loop while something is queued/running.
 	useEffect( () => {
-		const active = tasks && tasks.some( ( t ) => [ 'queued', 'running', 'paused' ].includes( t.status ) );
+			const active = tasks && tasks.some( ( t ) => [ 'queued', 'running' ].includes( t.status ) );
 		if ( active && ! timerRef.current ) {
 			timerRef.current = setInterval( async () => {
-				if ( ticking ) return;
-				setTicking( true );
+					if ( tickingRef.current ) return;
+					tickingRef.current = true;
 				try {
 					await api.tick();
 					await load();
 				} catch ( e ) {
 					// ignore transient tick errors
-				} finally {
-					setTicking( false );
+					} finally {
+						tickingRef.current = false;
 				}
 			}, 4000 );
 		} else if ( ! active && timerRef.current ) {
@@ -49,7 +49,7 @@ export default function Tasks() {
 			timerRef.current = null;
 		}
 		return () => {
-			if ( ! active && timerRef.current ) {
+				if ( timerRef.current ) {
 				clearInterval( timerRef.current );
 				timerRef.current = null;
 			}

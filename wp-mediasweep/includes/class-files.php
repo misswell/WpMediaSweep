@@ -12,6 +12,20 @@ defined( 'ABSPATH' ) || exit;
 
 class MSW_Files {
 
+	/** Run one operation under a connection-scoped MySQL advisory lock. */
+	public static function with_lock( $scope, $callback ) {
+		global $wpdb;
+		$key = 'msw_' . md5( ABSPATH . $wpdb->prefix . ':' . $scope );
+		if ( '1' !== (string) $wpdb->get_var( $wpdb->prepare( 'SELECT GET_LOCK(%s, 0)', $key ) ) ) {
+			return new WP_Error( 'msw_busy', 'Another operation is using this resource. Please retry.' );
+		}
+		try {
+			return call_user_func( $callback );
+		} finally {
+			$wpdb->get_var( $wpdb->prepare( 'SELECT RELEASE_LOCK(%s)', $key ) );
+		}
+	}
+
 	/**
 	 * True when $path is a real filesystem path inside wp-content/uploads
 	 * (the MediaSweep trash root included) — resolved, no traversal.
@@ -63,6 +77,18 @@ class MSW_Files {
 			return '';
 		}
 
-		return rtrim( $real, '/' ) . '/' . ltrim( $suffix, '/' );
+		$parts = explode( '/', rtrim( $real, '/' ) . '/' . ltrim( $suffix, '/' ) );
+		$normalized = array();
+		foreach ( $parts as $part ) {
+			if ( '' === $part || '.' === $part ) {
+				continue;
+			}
+			if ( '..' === $part ) {
+				array_pop( $normalized );
+			} else {
+				$normalized[] = $part;
+			}
+		}
+		return '/' . implode( '/', $normalized );
 	}
 }

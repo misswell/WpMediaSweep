@@ -34,6 +34,22 @@ for WordPress media libraries*.
 
 Requires WordPress 5.8+, PHP 7.4+.
 
+### v0.3.4
+
+- Separate **Unused** and **Trash** tabs, including Simplified Chinese labels.
+- Keep the first original backup when recompressing; serialize image operations and background task ticks.
+- Save recovery manifests before moving files, roll back failed trash moves, and retain manifests for interrupted restores.
+- Resume selected compression from its saved position, preserve pause/cancel state, and index new uploads before auto compression.
+- Preserve theme/plugin references during single-image analysis; detect ID-only blocks and size-variant URLs with paginated queries.
+- Fix expired trash cleanup and keep unfinished recovery entries out of automatic purge.
+
+Local regression checks:
+
+```bash
+php tests/test-safety-regressions.php  # Requires GD and PDO SQLite
+node tests/test-ui-control.mjs
+```
+
 ### Running the test stack (optional)
 
 The Docker test stack reads its database passwords from a local `.env` file

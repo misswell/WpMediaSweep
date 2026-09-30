@@ -172,27 +172,31 @@ class MSW_Task_Manager {
 	}
 
 	public static function pause( $id ) {
-		$task = self::get( $id );
-		if ( $task && in_array( $task['status'], array( 'queued', 'running' ), true ) ) {
-			self::update( $id, array( 'status' => 'paused' ) );
+		if ( self::transition( $id, 'paused', array( 'queued', 'running' ) ) ) {
 			MSW_Logger::info( 'task', sprintf( 'Task #%d paused.', $id ) );
 		}
 	}
 
 	public static function resume( $id ) {
-		$task = self::get( $id );
-		if ( $task && 'paused' === $task['status'] ) {
-			self::update( $id, array( 'status' => 'queued' ) );
+		if ( self::transition( $id, 'queued', array( 'paused' ) ) ) {
 			MSW_Logger::info( 'task', sprintf( 'Task #%d resumed.', $id ) );
 		}
 	}
 
 	public static function cancel( $id ) {
-		$task = self::get( $id );
-		if ( $task && in_array( $task['status'], array( 'queued', 'running', 'paused' ), true ) ) {
-			self::update( $id, array( 'status' => 'cancelled' ) );
+		if ( self::transition( $id, 'cancelled', array( 'queued', 'running', 'paused' ) ) ) {
 			MSW_Logger::info( 'task', sprintf( 'Task #%d cancelled.', $id ) );
 		}
+	}
+
+	/** Conditional transitions preserve a concurrent pause, cancel or completion. */
+	protected static function transition( $id, $status, $from ) {
+		global $wpdb;
+		$holders = implode( ',', array_fill( 0, count( $from ), '%s' ) );
+		return $wpdb->query( $wpdb->prepare(
+			'UPDATE ' . MSW_Database::table( MSW_Database::TASKS ) . " SET status = %s, updated_at = %s WHERE id = %d AND status IN ({$holders})",
+			array_merge( array( $status, current_time( 'mysql', true ), (int) $id ), $from )
+		) );
 	}
 
 	/**
@@ -203,6 +207,13 @@ class MSW_Task_Manager {
 	 * @return bool True if a task ran and may still have work.
 	 */
 	public static function tick() {
+		$result = MSW_Files::with_lock( 'task-tick', array( __CLASS__, 'tick_locked' ) );
+		return is_wp_error( $result ) ? false : $result;
+	}
+
+	/** Called only while the task worker lock is held. */
+	public static function tick_locked() {
+		global $wpdb;
 		// Recover stale running tasks (crashed mid-step): requeue, handlers are idempotent.
 		self::recover_stale();
 
@@ -217,27 +228,43 @@ class MSW_Task_Manager {
 			return false;
 		}
 
-		self::update( $task['id'], array( 'status' => 'running' ) );
+		self::transition( $task['id'], 'running', array( 'queued', 'running' ) );
+		$fresh = self::get( $task['id'] );
+		if ( ! $fresh || 'running' !== $fresh['status'] ) {
+			return false;
+		}
 
 		$budget = (int) MSW_Settings::get( 'time_budget', 20 );
 		$start  = microtime( true );
 
 		try {
 			$more = call_user_func( self::$handlers[ $task['type'] ], $task, $budget );
-		} catch ( Exception $e ) {
+		} catch ( Throwable $e ) {
 			MSW_Logger::error( 'task', sprintf( 'Task #%d crashed: %s', $task['id'], $e->getMessage() ) );
-			self::update( $task['id'], array( 'status' => 'queued' ) );
+			$wpdb->query( $wpdb->prepare(
+				'UPDATE ' . MSW_Database::table( MSW_Database::TASKS ) . " SET status = 'queued', updated_at = %s WHERE id = %d AND status = 'running'",
+				current_time( 'mysql', true ), $task['id']
+			) );
 			return false;
 		}
 
 		$task = self::get( $task['id'] );
+		if ( ! $task || in_array( $task['status'], array( 'paused', 'cancelled' ), true ) ) {
+			return false;
+		}
 
 		if ( false === $more ) {
 			$status = 'completed';
 			if ( $task && $task['failed'] > 0 && 0 === $task['processed'] ) {
 				$status = 'failed';
 			}
-			self::update( $task['id'], array( 'status' => $status ) );
+			$changed = $wpdb->query( $wpdb->prepare(
+				'UPDATE ' . MSW_Database::table( MSW_Database::TASKS ) . " SET status = %s, updated_at = %s WHERE id = %d AND status = 'running'",
+				$status, current_time( 'mysql', true ), $task['id']
+			) );
+			if ( ! $changed ) {
+				return false;
+			}
 			MSW_Logger::info(
 				'task',
 				sprintf( 'Task #%d (%s) finished: %d processed, %d failed.', $task['id'], $task['type'], $task['processed'], $task['failed'] )
@@ -247,7 +274,7 @@ class MSW_Task_Manager {
 
 		// Pause check: user may have paused while the handler was running.
 		$fresh = self::get( $task['id'] );
-		if ( $fresh && 'paused' === $fresh['status'] ) {
+		if ( $fresh && in_array( $fresh['status'], array( 'paused', 'cancelled' ), true ) ) {
 			return false;
 		}
 

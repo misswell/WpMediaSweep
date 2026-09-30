@@ -228,6 +228,25 @@ class MSW_Scanner {
 	 * @param string  $root   Uploads basedir.
 	 * @param array   $cursor Cursor (updated in place).
 	 */
+	/** Index one new upload before the on-upload compressor needs its row. */
+	public static function index_attachment( $attachment_id, $rel ) {
+		global $wpdb;
+		$root = self::uploads_basedir();
+		$path = $root . '/' . $rel;
+		if ( ! MSW_Files::within_uploads( $path ) || ! is_file( $path )
+			|| ! in_array( strtolower( pathinfo( $path, PATHINFO_EXTENSION ) ), self::IMAGE_EXTS, true ) ) {
+			return 0;
+		}
+		$cursor = array( 'files_done' => 0 );
+		self::index_files( array( array( 'rel' => $rel, 'thumb' => 0 ) ), $root, $cursor );
+		$table = MSW_Database::table( MSW_Database::IMAGES );
+		$id = (int) $wpdb->get_var( $wpdb->prepare( "SELECT id FROM {$table} WHERE file_rel_path = %s AND is_thumbnail = 0", $rel ) );
+		if ( $id ) {
+			$wpdb->update( $table, array( 'attachment_id' => (int) $attachment_id ), array( 'id' => $id ), array( '%d' ), array( '%d' ) );
+		}
+		return $id;
+	}
+
 	protected static function index_files( $items, $root, &$cursor ) {
 		global $wpdb;
 

@@ -48,7 +48,18 @@ class MSW_Cleaner {
 				continue;
 			}
 
-			$result = self::trash_single( $image );
+			$result = MSW_Files::with_lock( 'image-' . (int) $image_id, function () use ( $image_id ) {
+				global $wpdb;
+				$fresh = $wpdb->get_row( $wpdb->prepare( 'SELECT * FROM ' . MSW_Database::table( MSW_Database::IMAGES ) . ' WHERE id = %d', $image_id ), ARRAY_A );
+				if ( ! $fresh || 'active' !== $fresh['status'] ) {
+					return new WP_Error( 'msw_cleanup', 'Image is not active.' );
+				}
+				$result = self::trash_single( $fresh );
+				if ( ! is_wp_error( $result ) ) {
+					$wpdb->update( MSW_Database::table( MSW_Database::IMAGES ), array( 'status' => 'trash', 'updated_at' => current_time( 'mysql', true ) ), array( 'id' => $image_id ), array( '%s', '%s' ), array( '%d' ) );
+				}
+				return $result;
+			} );
 			if ( is_wp_error( $result ) ) {
 				$summary['failed']++;
 				$summary['errors'][] = sprintf( '%s: %s', $image['file_name'], $result->get_error_message() );
@@ -56,19 +67,6 @@ class MSW_Cleaner {
 			}
 
 			$summary['trashed']++;
-
-			// Keep the index row with a lifecycle status; the manifest holds the
-			// file truth. Restore flips the status back to active.
-			$wpdb->update(
-				MSW_Database::table( MSW_Database::IMAGES ),
-				array(
-					'status'     => 'trash',
-					'updated_at' => current_time( 'mysql', true ),
-				),
-				array( 'id' => $image_id ),
-				array( '%s', '%s' ),
-				array( '%d' )
-			);
 
 			MSW_Logger::info( 'cleanup', sprintf( 'Trashed %s (image #%d).', $image['file_name'], $image_id ) );
 		}
@@ -98,6 +96,10 @@ class MSW_Cleaner {
 			: 'file-' . substr( md5( $rel ), 0, 12 );
 
 		$dest_dir = self::trash_dir() . '/' . $token . '/' . dirname( $rel );
+		$manifest_path = self::trash_dir() . '/' . $token . '/manifest.json';
+		if ( ! MSW_Files::within_uploads( $dest_dir ) || ! MSW_Files::within_uploads( $manifest_path ) || file_exists( $manifest_path ) ) {
+			return new WP_Error( 'msw_cleanup', 'Unsafe or existing trash entry; restore it before retrying.' );
+		}
 		if ( ! wp_mkdir_p( $dest_dir ) ) {
 			return new WP_Error( 'msw_cleanup', 'Cannot create trash directory.' );
 		}
@@ -107,6 +109,7 @@ class MSW_Cleaner {
 			'attachment_id' => (int) $image['attachment_id'],
 			'rel_path'      => $rel,
 			'trashed_at'    => current_time( 'mysql', true ),
+			'state'         => 'moving',
 			'files'         => array(),
 		);
 
@@ -116,28 +119,52 @@ class MSW_Cleaner {
 			$file_rel = ltrim( substr( $file, strlen( $uploads_root ) ), '/' );
 			$target   = self::trash_dir() . '/' . $token . '/' . $file_rel;
 
-			if ( ! @rename( $file, $target ) ) {
-				return new WP_Error( 'msw_cleanup', 'Cannot move ' . basename( $file ) . ' to trash.' );
+			if ( ! MSW_Files::within_uploads( $file ) || ! MSW_Files::within_uploads( $target ) || file_exists( $target ) || is_link( $target ) ) {
+				return new WP_Error( 'msw_cleanup', 'Unsafe or occupied trash destination.' );
 			}
-
+			$hash = @hash_file( 'sha256', $file );
+			if ( ! $hash ) {
+				return new WP_Error( 'msw_cleanup', 'Cannot read file before moving it to trash.' );
+			}
 			$manifest['files'][] = array(
 				'from' => $file_rel,
 				'to'   => basename( $target ),
+				'sha256' => $hash,
 			);
+		}
+
+		// Save the entire recovery plan before the first move, including crash recovery.
+		if ( ! self::write_manifest( $manifest_path, $manifest ) ) {
+			return new WP_Error( 'msw_cleanup', 'Cannot save trash recovery manifest.' );
+		}
+		$moved = array();
+		foreach ( $manifest['files'] as $file ) {
+			$from = $uploads_root . '/' . $file['from'];
+			$target = self::trash_dir() . '/' . $token . '/' . $file['from'];
+			if ( ! @rename( $from, $target ) ) {
+				self::rollback_moves( $moved, $manifest_path );
+				return new WP_Error( 'msw_cleanup', 'Cannot move ' . basename( $from ) . ' to trash. Recovery manifest retained if rollback failed.' );
+			}
+			$moved[] = array( $from, $target );
+		}
+		$manifest['state'] = 'trashed';
+		if ( ! self::write_manifest( $manifest_path, $manifest ) ) {
+			self::rollback_moves( $moved, $manifest_path );
+			return new WP_Error( 'msw_cleanup', 'Cannot finalize trash manifest.' );
 		}
 
 		// Trash the native attachment (recoverable via wp_untrash_post).
 		if ( $image['attachment_id'] > 0 ) {
 			$attachment = get_post( (int) $image['attachment_id'] );
 			if ( $attachment && 'trash' !== $attachment->post_status ) {
-				wp_trash_post( (int) $image['attachment_id'] );
+				if ( ! wp_trash_post( (int) $image['attachment_id'] ) ) {
+					$manifest['state'] = 'moving';
+					self::write_manifest( $manifest_path, $manifest );
+					self::rollback_moves( $moved, $manifest_path );
+					return new WP_Error( 'msw_cleanup', 'Cannot trash the WordPress attachment.' );
+				}
 			}
 		}
-
-		file_put_contents(
-			self::trash_dir() . '/' . $token . '/manifest.json',
-			wp_json_encode( $manifest, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES )
-		);
 
 		return true;
 	}
@@ -150,6 +177,21 @@ class MSW_Cleaner {
 	 */
 	public static function restore_trashed( $token ) {
 		$token = preg_replace( '/[^a-zA-Z0-9\-]/', '', (string) $token );
+		$path = self::trash_dir() . '/' . $token . '/manifest.json';
+		if ( '' === $token || ! MSW_Files::within_uploads( $path ) || ! is_file( $path ) ) {
+			return new WP_Error( 'msw_cleanup', 'Trash entry not found.' );
+		}
+		$manifest = json_decode( (string) file_get_contents( $path ), true );
+		if ( ! is_array( $manifest ) || empty( $manifest['image_id'] ) ) {
+			return new WP_Error( 'msw_cleanup', 'Invalid manifest.' );
+		}
+		return MSW_Files::with_lock( 'image-' . (int) $manifest['image_id'], function () use ( $token ) {
+			return self::restore_trashed_locked( $token );
+		} );
+	}
+
+	protected static function restore_trashed_locked( $token ) {
+		$token = preg_replace( '/[^a-zA-Z0-9\-]/', '', (string) $token );
 		$entry = self::trash_dir() . '/' . $token;
 
 		$manifest_path = $entry . '/manifest.json';
@@ -158,44 +200,69 @@ class MSW_Cleaner {
 		}
 
 		$manifest = json_decode( (string) file_get_contents( $manifest_path ), true );
-		if ( ! is_array( $manifest ) || empty( $manifest['rel_path'] ) ) {
+		if ( ! is_array( $manifest ) || empty( $manifest['rel_path'] ) || empty( $manifest['files'] ) ) {
 			return new WP_Error( 'msw_cleanup', 'Invalid manifest.' );
 		}
 
 		$uploads_root = MSW_Scanner::uploads_basedir();
+		// Upgrade legacy manifests before any moves so interrupted restores can retry.
+		foreach ( $manifest['files'] as &$file ) {
+			$source = $entry . '/' . $file['from'];
+			if ( empty( $file['sha256'] ) && MSW_Files::within_uploads( $source ) && is_file( $source ) ) {
+				$file['sha256'] = @hash_file( 'sha256', $source );
+			}
+		}
+		unset( $file );
+		$manifest['state'] = 'restoring';
+		if ( ! self::write_manifest( $manifest_path, $manifest ) ) {
+			return new WP_Error( 'msw_cleanup', 'Cannot save restore state.' );
+		}
 
 		// Move files back.
 		foreach ( (array) $manifest['files'] as $file ) {
 			$from   = $entry . '/' . $file['from'];
 			$target = $uploads_root . '/' . $file['from'];
+			if ( ! MSW_Files::within_uploads( $from ) || ! MSW_Files::within_uploads( $target ) || is_link( $from ) || is_link( $target ) ) {
+				return new WP_Error( 'msw_cleanup', 'Unsafe restore path.' );
+			}
+			if ( ! is_file( $from ) ) {
+				// A previous partial restore/rollback may already have put this file back.
+				if ( is_file( $target ) && ! empty( $file['sha256'] ) && hash_file( 'sha256', $target ) === $file['sha256'] ) {
+					continue;
+				}
+				return new WP_Error( 'msw_cleanup', 'A recovery file is missing; manifest retained.' );
+			}
+			if ( file_exists( $target ) ) {
+				return new WP_Error( 'msw_cleanup', 'Restore destination already exists; no files were overwritten.' );
+			}
 
 			$dir = dirname( $target );
 			if ( ! is_dir( $dir ) ) {
-				wp_mkdir_p( $dir );
+				if ( ! wp_mkdir_p( $dir ) ) {
+					return new WP_Error( 'msw_cleanup', 'Cannot create restore directory.' );
+				}
 			}
 
-			if ( is_file( $from ) ) {
-				@rename( $from, $target );
+			if ( ! @rename( $from, $target ) ) {
+				return new WP_Error( 'msw_cleanup', 'Cannot restore file; recovery manifest retained.' );
 			}
 		}
-
-		// Remove the now (hopefully) empty trash entry; leftovers are purged later.
-		@unlink( $manifest_path );
-		@rmdir( $entry );
 
 		// Restore the attachment from WordPress trash.
 		$att_id = isset( $manifest['attachment_id'] ) ? (int) $manifest['attachment_id'] : 0;
 		if ( $att_id ) {
 			$attachment = get_post( $att_id );
 			if ( $attachment && 'trash' === $attachment->post_status ) {
-				wp_untrash_post( $att_id );
+				if ( ! wp_untrash_post( $att_id ) ) {
+					return new WP_Error( 'msw_cleanup', 'Cannot restore the WordPress attachment; manifest retained.' );
+				}
 			}
 		}
 
 		// Flip the index row back to active.
 		if ( ! empty( $manifest['image_id'] ) ) {
 			global $wpdb;
-			$wpdb->update(
+			$updated = $wpdb->update(
 				MSW_Database::table( MSW_Database::IMAGES ),
 				array(
 					'status'     => 'active',
@@ -205,12 +272,46 @@ class MSW_Cleaner {
 				array( '%s', '%s' ),
 				array( '%d' )
 			);
+			if ( false === $updated ) {
+				return new WP_Error( 'msw_cleanup', 'Cannot update restored image index; manifest retained.' );
+			}
 		}
+		if ( ! @unlink( $manifest_path ) ) {
+			return new WP_Error( 'msw_cleanup', 'Files restored, but recovery manifest could not be removed.' );
+		}
+		@rmdir( $entry );
 
 		// Re-index the restored file on the next scan; log it.
 		MSW_Logger::info( 'cleanup', sprintf( 'Restored %s from trash (token %s).', $manifest['rel_path'], $token ) );
 
 		return true;
+	}
+
+	/** Persist a manifest atomically; never truncate the last recovery plan. */
+	protected static function write_manifest( $path, $manifest ) {
+		$tmp = dirname( $path ) . '/.manifest-' . uniqid( '', true );
+		if ( ! MSW_Files::within_uploads( $path ) || ! MSW_Files::within_uploads( $tmp ) || is_link( $path ) ) {
+			return false;
+		}
+		$json = wp_json_encode( $manifest, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES );
+		$ok = is_string( $json ) && strlen( $json ) === @file_put_contents( $tmp, $json ) && @rename( $tmp, $path );
+		if ( is_file( $tmp ) ) {
+			@unlink( $tmp );
+		}
+		return $ok;
+	}
+
+	/** Roll back completed moves; keep the plan if any rollback cannot finish. */
+	protected static function rollback_moves( $moves, $manifest_path ) {
+		$ok = true;
+		foreach ( array_reverse( $moves ) as $move ) {
+			if ( ! MSW_Files::within_uploads( $move[0] ) || ! MSW_Files::within_uploads( $move[1] ) || file_exists( $move[0] ) || ! @rename( $move[1], $move[0] ) ) {
+				$ok = false;
+			}
+		}
+		if ( $ok ) {
+			@unlink( $manifest_path );
+		}
 	}
 
 	/**
@@ -314,44 +415,59 @@ class MSW_Cleaner {
 		$purged    = 0;
 
 		foreach ( self::list_trash() as $entry ) {
-			$trashed_at = isset( $entry['trashed_at'] ) ? strtotime( $entry['trashed_at'] ) : 0;
-			if ( ! $trashed_at || $trashed_at > $cutoff ) {
-				continue;
+			$result = MSW_Files::with_lock( 'image-' . (int) ( $entry['image_id'] ?? 0 ), function () use ( $entry, $cutoff ) {
+				return self::purge_entry( $entry['token'], $cutoff );
+			} );
+			if ( true === $result ) {
+				$purged++;
 			}
+		}
+		return $purged;
+	}
 
-			// Permanently delete the attachment record.
-			if ( ! empty( $entry['attachment_id'] ) ) {
-				$attachment = get_post( (int) $entry['attachment_id'] );
-				if ( $attachment ) {
-					wp_delete_post( (int) $entry['attachment_id'], true );
-				}
-			}
-
-			// Drop the trashed index rows for good (originals + their size variants).
-			if ( ! empty( $entry['image_id'] ) ) {
-				$wpdb->query(
-					$wpdb->prepare(
-						'DELETE FROM ' . MSW_Database::table( MSW_Database::IMAGES ) . ' WHERE id = %d OR parent_file_id = %d', // phpcs:ignore
-						(int) $entry['image_id'],
-						(int) $entry['image_id']
-					)
-				);
-				$wpdb->delete(
-					MSW_Database::table( MSW_Database::REFERENCES ),
-					array( 'image_id' => (int) $entry['image_id'] ),
-					array( '%d' )
-				);
-			}
-
-			// Remove files.
-			$dir = self::trash_dir() . '/' . $entry['token'];
-			self::rrmdir( $dir );
-
-			MSW_Logger::info( 'cleanup', sprintf( 'Purged trash entry %s (%s).', $entry['token'], $entry['rel_path'] ) );
-			$purged++;
+	/** Re-read the entry under the same lock used by trash and restore. */
+	protected static function purge_entry( $token, $cutoff ) {
+		global $wpdb;
+		$path = self::trash_dir() . '/' . $token . '/manifest.json';
+		if ( ! MSW_Files::within_uploads( $path ) || ! is_file( $path ) ) {
+			return false;
+		}
+		$entry = json_decode( (string) file_get_contents( $path ), true );
+		if ( ! is_array( $entry ) ) {
+			return false;
+		}
+		$entry['token'] = $token;
+		if ( isset( $entry['state'] ) && 'trashed' !== $entry['state'] ) {
+			return false;
+		}
+		$trashed_at = isset( $entry['trashed_at'] ) ? strtotime( $entry['trashed_at'] ) : 0;
+		if ( ! $trashed_at || $trashed_at > $cutoff ) {
+			return false;
 		}
 
-		return $purged;
+		// Permanently delete only a still-trashed attachment.
+		if ( ! empty( $entry['attachment_id'] ) ) {
+			$attachment = get_post( (int) $entry['attachment_id'] );
+			if ( $attachment && ( 'trash' !== $attachment->post_status || ! wp_delete_post( (int) $entry['attachment_id'], true ) ) ) {
+				return false;
+			}
+		}
+		if ( ! empty( $entry['image_id'] ) ) {
+			$deleted = $wpdb->query( $wpdb->prepare(
+				'DELETE FROM ' . MSW_Database::table( MSW_Database::IMAGES ) . ' WHERE id = %d OR parent_file_id = %d',
+				(int) $entry['image_id'], (int) $entry['image_id']
+			) );
+			$refs_deleted = $wpdb->delete( MSW_Database::table( MSW_Database::REFERENCES ), array( 'image_id' => (int) $entry['image_id'] ), array( '%d' ) );
+			if ( false === $deleted || false === $refs_deleted ) {
+				return false;
+			}
+		}
+		$dir = self::trash_dir() . '/' . $entry['token'];
+		if ( ! self::rrmdir( $dir ) ) {
+			return false;
+		}
+		MSW_Logger::info( 'cleanup', sprintf( 'Purged trash entry %s (%s).', $entry['token'], $entry['rel_path'] ) );
+		return true;
 	}
 
 	/**
@@ -391,34 +507,37 @@ class MSW_Cleaner {
 		$root = rtrim( self::trash_dir(), '/' );
 		$dir  = rtrim( (string) $dir, '/' );
 
-		if ( 0 !== strpos( $dir, $root . '/' ) ) {
-			return; // Never touch anything outside the trash root.
+		if ( 0 !== strpos( $dir, $root . '/' ) || ! MSW_Files::within_uploads( $dir ) || is_link( $dir ) ) {
+			return false;
 		}
 
-		$queue = array( $dir );
+		$queue = array( array( $dir, false ) );
 		while ( $queue ) {
-			$current = array_pop( $queue );
+			list( $current, $visited ) = array_pop( $queue );
+			if ( $visited ) {
+				@rmdir( $current );
+				continue;
+			}
 			$entries = @scandir( $current );
 			if ( ! is_array( $entries ) ) {
 				continue;
 			}
-			$empty = true;
+			$queue[] = array( $current, true );
 			foreach ( $entries as $entry ) {
-				if ( '' === $entry || '.' === $entry[0] || '..' === $entry ) {
+				if ( '.' === $entry || '..' === $entry ) {
 					continue;
 				}
 				$path = $current . '/' . $entry;
+				if ( ! MSW_Files::within_uploads( $path ) || is_link( $path ) ) {
+					continue;
+				}
 				if ( is_dir( $path ) ) {
-					$queue[] = $path;
-					$empty   = false;
+					$queue[] = array( $path, false );
 				} else {
 					@unlink( $path );
 				}
 			}
-			if ( $empty ) {
-				@rmdir( $current );
-			}
 		}
-		@rmdir( $dir );
+		return ! is_dir( $dir );
 	}
 }
