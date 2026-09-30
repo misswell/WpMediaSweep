@@ -1,6 +1,9 @@
 # Build tooling
 node_modules/
 
+# Local test stack secrets (use .env.example as template)
+.env
+
 # macOS
 .DS_Store
 

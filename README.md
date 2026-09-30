@@ -30,6 +30,16 @@ for WordPress media libraries*.
 
 Requires WordPress 5.8+, PHP 7.4+.
 
+### Running the test stack (optional)
+
+The Docker test stack reads its database passwords from a local `.env` file
+(never committed):
+
+```bash
+cp .env.example .env
+docker compose -f docker-compose.test.yml up -d
+```
+
 ## How it stays safe on large sites
 
 - **Nothing loads in one go.** Scan, reference scan and compression all run as

@@ -2,10 +2,10 @@ services:
   db:
     image: mariadb:11
     environment:
-      MYSQL_ROOT_PASSWORD: mswroot
+      MYSQL_ROOT_PASSWORD: ${MSW_TEST_DB_ROOT:?set MSW_TEST_DB_ROOT in .env}
       MYSQL_DATABASE: wordpress
       MYSQL_USER: wordpress
-      MYSQL_PASSWORD: wordpress
+      MYSQL_PASSWORD: ${MSW_TEST_DB_PASSWORD:?set MSW_TEST_DB_PASSWORD in .env}
     healthcheck:
       test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
       interval: 3s
@@ -22,7 +22,7 @@ services:
     environment:
       WORDPRESS_DB_HOST: db
       WORDPRESS_DB_USER: wordpress
-      WORDPRESS_DB_PASSWORD: wordpress
+      WORDPRESS_DB_PASSWORD: ${MSW_TEST_DB_PASSWORD}
       WORDPRESS_DB_NAME: wordpress
     volumes:
       - wp_data:/var/www/html
@@ -35,7 +35,7 @@ services:
     environment:
       WORDPRESS_DB_HOST: db
       WORDPRESS_DB_USER: wordpress
-      WORDPRESS_DB_PASSWORD: wordpress
+      WORDPRESS_DB_PASSWORD: ${MSW_TEST_DB_PASSWORD}
       WORDPRESS_DB_NAME: wordpress
     volumes:
       - wp_data:/var/www/html
