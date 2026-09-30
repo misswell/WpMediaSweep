@@ -217,14 +217,26 @@ export default function ImageTable( { lockedStatus } ) {
 									/>
 								</td>
 								<td className="msw-col-thumb">
-									{ row.thumbnail_url ? (
-										<img src={ row.thumbnail_url } alt="" className="msw-thumb" loading="lazy" />
+									{ ( row.thumbnail_url || row.file_url ) ? (
+										<a href={ row.file_url || row.thumbnail_url } target="_blank" rel="noreferrer">
+											<img
+												src={ row.thumbnail_url || row.file_url }
+												alt=""
+												className="msw-thumb"
+												loading="lazy"
+												onError={ ( e ) => { e.target.style.display = 'none'; } }
+											/>
+										</a>
 									) : (
 										<span className="msw-thumb msw-thumb-empty">{ row.mime_type }</span>
 									) }
 								</td>
 								<td>
-									<strong>{ row.file_name }</strong>
+									{ row.file_url ? (
+										<a href={ row.file_url } target="_blank" rel="noreferrer"><strong>{ row.file_name }</strong></a>
+									) : (
+										<strong>{ row.file_name }</strong>
+									) }
 									<div className="msw-file-meta">
 										{ row.file_rel_path }
 										<br />
@@ -236,7 +248,7 @@ export default function ImageTable( { lockedStatus } ) {
 								</td>
 								<td className="msw-col-num">{ sizeFormat( row.file_size ) }</td>
 								<td>
-									{ row.compressed ? (
+									{ Number( row.compressed ) === 1 ? (
 										<span className="msw-saved">
 											{ __( 'Compressed', 'mediasweep' ) } · { row.compression_ratio }%
 											<br />

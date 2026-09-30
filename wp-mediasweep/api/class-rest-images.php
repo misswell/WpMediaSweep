@@ -86,6 +86,7 @@ class MSW_Rest_Images {
 			$row['reference_count']   = (int) $row['reference_count'];
 			$row['risk_level']        = self::risk_level( $row );
 			$row['thumbnail_url']     = self::thumbnail_url( $row );
+			$row['file_url']          = self::file_url( $row );
 			$row['edit_url']          = $row['attachment_id']
 				? admin_url( 'post.php?post=' . $row['attachment_id'] . '&action=edit' )
 				: '';
@@ -127,6 +128,21 @@ class MSW_Rest_Images {
 				return 'safe'; // No media library record; safe once reviewed.
 		}
 		return 'cautious';
+	}
+
+	/**
+	 * Direct URL of the indexed file (works for orphans and every variant —
+	 * the file physically lives in uploads, no attachment needed).
+	 *
+	 * @param array $row Image row.
+	 * @return string
+	 */
+	public static function file_url( $row ) {
+		$uploads = wp_get_upload_dir();
+		if ( empty( $uploads['baseurl'] ) || empty( $row['file_rel_path'] ) ) {
+			return '';
+		}
+		return trailingslashit( $uploads['baseurl'] ) . ltrim( $row['file_rel_path'], '/' );
 	}
 
 	/**
