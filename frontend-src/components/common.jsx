@@ -1,10 +1,22 @@
-import { STATUS_LABELS, STATUS_COLORS, TASK_STATUS_LABELS } from '../format';
+import { STATUS_LABELS, STATUS_COLORS, TASK_STATUS_LABELS, RISK_LABELS, RISK_COLORS } from '../format';
 
 export function StatusBadge({ status }) {
 	const label = STATUS_LABELS[status] || status;
 	const color = STATUS_COLORS[status] || '#8c8f94';
 	return (
 		<span className="msw-badge" style={ { borderColor: color, color } }>
+			<span className="msw-badge-dot" style={ { background: color } } />
+			{ label }
+		</span>
+	);
+}
+
+export function RiskBadge({ level }) {
+	if (!level) return null;
+	const label = RISK_LABELS[level] || level;
+	const color = RISK_COLORS[level] || '#8c8f94';
+	return (
+		<span className="msw-badge msw-risk-badge" style={ { borderColor: color, color } }>
 			<span className="msw-badge-dot" style={ { background: color } } />
 			{ label }
 		</span>

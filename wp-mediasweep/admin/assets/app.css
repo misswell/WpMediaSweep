@@ -215,6 +215,10 @@
 	display: inline-block;
 }
 
+.msw-risk {
+	margin-top: 4px;
+}
+
 /* Toolbar */
 .msw-toolbar {
 	display: flex;

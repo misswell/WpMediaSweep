@@ -15,11 +15,14 @@ for WordPress media libraries*.
 
 | Module | What it gives you |
 |---|---|
-| **Media scan** | Indexes every image under `wp-content/uploads` (jpg / jpeg / png / webp / avif), batched at 200 files per step, resumable |
+| **Media scan** | Indexes every image under `wp-content/uploads` (jpg / jpeg / png / webp / avif) in resumable batches, including WordPress `-WxH` size variants linked to their parent; md5 hash computed for every file |
 | **Compression** | Octo Engine (PHP port of the OctoShrink strategy): Imagick → GD backend chain, per-format quality (JPEG 85 / PNG lossless / WebP 80 / AVIF 65) |
-| **Safety** | Backup → compress → validate → replace. Originals kept as `.ms-original`, one-click restore, "no improvement → keep original" rule |
+| **Safety** | Backup → compress → validate → replace. Originals kept as `.ms-original`, one-click restore, "no improvement → keep original" rule, configurable backup retention with daily cleanup |
 | **Reference analysis** | Detects where each image is used: post content, featured images, Gutenberg blocks, WooCommerce galleries, Elementor data, theme/plugin files |
+| **Risk grading** | Every candidate graded: *safe* (no media library record) / *delete with care* (attachment exists, no references) / *do not delete* (referenced) |
+| **Duplicate detection** | md5 grouping across original images — shows identical copies and reclaimable space |
 | **Cleanup** | Unused candidates → your confirmation → trash (files moved to `uploads/ms-trash` with manifest + WP native attachment trash) → auto purge after 30 days |
+| **WP-CLI** | `wp mediasweep scan / references / compress / unused / clean / duplicates / stats / tick` for large sites |
 
 ## Installation
 
@@ -58,8 +61,9 @@ Namespace `mediasweep/v1` (all routes require `manage_options`):
 
 | Method | Route | Purpose |
 |---|---|---|
-| GET | `/stats` | Dashboard statistics |
-| GET | `/images` | Index list (`status`, `compressed`, `search`, `page`, `per_page`) |
+| GET | `/stats` | Dashboard statistics (files, bytes, compression, references, duplicates) |
+| GET | `/images` | Index list (`status`, `compressed`, `search`, `thumbnails`, `page`, `per_page`) with `risk_level` per row |
+| GET | `/duplicates` | Duplicate groups (identical md5 among originals) |
 | GET | `/images/{id}/references` | Where an image is referenced |
 | POST | `/images/{id}/analyze` | Re-run reference detection for one image |
 | POST | `/images/{id}/restore` | Restore the `.ms-original` backup |
@@ -97,8 +101,8 @@ stripped, so rotated photos never break.
 
 ## Roadmap
 
-- Phase 3: duplicate detection (pHash), on-upload auto-compress, background
-  thumbnail compression.
+- Phase 3: pHash perceptual duplicates (near-identical, not just byte-identical),
+  on-upload auto-compress, background thumbnail compression.
 
 ## License
 

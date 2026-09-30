@@ -36,6 +36,11 @@ class MSW_Plugin {
 			MSW_Admin::init();
 		}
 
+		// WP-CLI.
+		if ( defined( 'WP_CLI' ) && WP_CLI ) {
+			MSW_CLI::register();
+		}
+
 		// REST API.
 		add_action( 'rest_api_init', array( $this, 'rest_api_init' ) );
 
@@ -52,6 +57,16 @@ class MSW_Plugin {
 			'methods'             => 'GET',
 			'callback'            => array( __CLASS__, 'rest_stats' ),
 			'permission_callback' => array( __CLASS__, 'rest_permission' ),
+		) );
+
+		// Duplicate groups (identical md5).
+		register_rest_route( 'mediasweep/v1', '/duplicates', array(
+			'methods'             => 'GET',
+			'callback'            => array( __CLASS__, 'rest_duplicates' ),
+			'permission_callback' => array( __CLASS__, 'rest_permission' ),
+			'args'                => array(
+				'limit' => array( 'type' => 'integer', 'default' => 50 ),
+			),
 		) );
 
 		// Images list.
@@ -199,6 +214,8 @@ class MSW_Plugin {
 
 	/**
 	 * Aggregate statistics for the dashboard.
+	 * File counts cover every indexed file; the compression/reference counters
+	 * are scoped to original images (size variants follow their parent).
 	 *
 	 * @return array
 	 */
@@ -211,15 +228,16 @@ class MSW_Plugin {
 			"SELECT
 				COUNT(*) AS total_files,
 				COALESCE( SUM( file_size ), 0 ) AS total_size,
-				COALESCE( SUM( compressed = 1 ), 0 ) AS compressed,
-				COALESCE( SUM( compressed = 0 AND file_size > 0 ), 0 ) AS pending,
-				COALESCE( SUM( CASE WHEN compressed = 1 THEN original_size - compressed_size ELSE 0 END ), 0 ) AS saved,
-				COALESCE( SUM( original_size ), 0 ) AS original_total,
-				COALESCE( SUM( CASE WHEN compressed = 1 THEN compressed_size ELSE 0 END ), 0 ) AS compressed_total,
-				COALESCE( SUM( reference_status = 'unused' ), 0 ) AS unused,
-				COALESCE( SUM( reference_status = 'maybe' ), 0 ) AS maybe_used,
-				COALESCE( SUM( reference_status = 'orphan' ), 0 ) AS orphan,
-				COALESCE( SUM( reference_status = 'used' ), 0 ) AS used
+				COALESCE( SUM( is_thumbnail = 0 ), 0 ) AS original_files,
+				COALESCE( SUM( is_thumbnail = 0 AND compressed = 1 ), 0 ) AS compressed,
+				COALESCE( SUM( is_thumbnail = 0 AND compressed = 0 AND file_size > 0 ), 0 ) AS pending,
+				COALESCE( SUM( CASE WHEN is_thumbnail = 0 AND compressed = 1 THEN original_size - compressed_size ELSE 0 END ), 0 ) AS saved,
+				COALESCE( SUM( CASE WHEN is_thumbnail = 0 AND compressed = 1 THEN compressed_size ELSE 0 END ), 0 ) AS compressed_total,
+				COALESCE( SUM( is_thumbnail = 0 AND reference_status = 'unused' ), 0 ) AS unused,
+				COALESCE( SUM( is_thumbnail = 0 AND reference_status = 'maybe' ), 0 ) AS maybe_used,
+				COALESCE( SUM( is_thumbnail = 0 AND reference_status = 'orphan' ), 0 ) AS orphan,
+				COALESCE( SUM( is_thumbnail = 0 AND reference_status = 'used' ), 0 ) AS used,
+				COALESCE( SUM( is_thumbnail = 0 AND compressed = 0 AND reference_status = 'unused' ), 0 ) AS unused_uncompressed
 			FROM {$images}", // phpcs:ignore
 			ARRAY_A
 		);
@@ -227,10 +245,10 @@ class MSW_Plugin {
 		$stats = array(
 			'total_files'      => (int) ( $row['total_files'] ?? 0 ),
 			'total_size'       => (int) ( $row['total_size'] ?? 0 ),
+			'original_files'   => (int) ( $row['original_files'] ?? 0 ),
 			'compressed'       => (int) ( $row['compressed'] ?? 0 ),
 			'pending'          => (int) ( $row['pending'] ?? 0 ),
 			'saved'            => (int) ( $row['saved'] ?? 0 ),
-			'original_total'   => (int) ( $row['original_total'] ?? 0 ),
 			'compressed_total' => (int) ( $row['compressed_total'] ?? 0 ),
 			'unused'           => (int) ( $row['unused'] ?? 0 ),
 			'maybe_used'       => (int) ( $row['maybe_used'] ?? 0 ),
@@ -244,14 +262,94 @@ class MSW_Plugin {
 			),
 		);
 
-		// Releasable estimate: uncompressed bytes of unused/orphan images.
+		// Releasable estimate: bytes of unused/orphan originals (incl. their size variants).
 		$stats['releasable'] = (int) $wpdb->get_var(
-			"SELECT COALESCE( SUM( file_size ), 0 ) FROM {$images} WHERE reference_status IN ('unused','orphan')" // phpcs:ignore
+			"SELECT COALESCE( SUM( t.file_size ), 0 ) FROM {$images} t
+				LEFT JOIN {$images} p ON t.parent_file_id = p.id AND t.is_thumbnail = 1
+				WHERE ( t.is_thumbnail = 0 AND t.reference_status IN ('unused','orphan') )
+				   OR ( t.is_thumbnail = 1 AND p.reference_status IN ('unused','orphan') )" // phpcs:ignore
 		);
+
+		// Duplicate images: identical md5 among originals.
+		$dup = $wpdb->get_row(
+			"SELECT COUNT(*) AS groups_count, COALESCE( SUM( files ), 0 ) AS files_count, COALESCE( SUM( excess ), 0 ) AS excess_size
+			FROM (
+				SELECT COUNT(*) AS files, SUM( file_size ) - MAX( file_size ) AS excess
+				FROM {$images}
+				WHERE is_thumbnail = 0 AND md5_hash <> ''
+				GROUP BY md5_hash HAVING COUNT(*) > 1
+			) d", // phpcs:ignore
+			ARRAY_A
+		);
+
+		$stats['duplicate_groups']   = (int) ( $dup['groups_count'] ?? 0 );
+		$stats['duplicate_files']    = (int) ( $dup['files_count'] ?? 0 );
+		$stats['duplicate_savings']  = (int) ( $dup['excess_size'] ?? 0 );
 
 		$stats['analyzed'] = $stats['used'] + $stats['unused'] + $stats['maybe_used'] + $stats['orphan'];
 
 		return rest_ensure_response( $stats );
+	}
+
+	/**
+	 * Duplicate groups (identical md5 among original images).
+	 *
+	 * @param WP_REST_Request $request Request.
+	 * @return WP_REST_Response
+	 */
+	public static function rest_duplicates( $request ) {
+		global $wpdb;
+
+		$images = MSW_Database::table( MSW_Database::IMAGES );
+		$limit  = min( 100, max( 1, (int) $request->get_param( 'limit' ) ) );
+
+		$groups = $wpdb->get_results(
+			$wpdb->prepare(
+				"SELECT md5_hash, COUNT(*) AS files, SUM( file_size ) AS total_size, SUM( file_size ) - MAX( file_size ) AS excess_size
+				FROM {$images}
+				WHERE is_thumbnail = 0 AND md5_hash <> ''
+				GROUP BY md5_hash HAVING COUNT(*) > 1
+				ORDER BY excess_size DESC
+				LIMIT %d", // phpcs:ignore
+				$limit
+			),
+			ARRAY_A
+		);
+
+		$out = array();
+		foreach ( (array) $groups as $group ) {
+			$files = $wpdb->get_results(
+				$wpdb->prepare(
+					"SELECT id, attachment_id, file_name, file_rel_path, file_size, width, height, reference_status
+					FROM {$images} WHERE is_thumbnail = 0 AND md5_hash = %s ORDER BY id ASC", // phpcs:ignore
+					$group['md5_hash']
+				),
+				ARRAY_A
+			);
+
+			foreach ( $files as &$file ) {
+				$file['id']            = (int) $file['id'];
+				$file['attachment_id'] = (int) $file['attachment_id'];
+				$file['file_size']     = (int) $file['file_size'];
+				$file['risk_level']    = MSW_Rest_Images::risk_level( $file );
+				$file['thumbnail_url'] = $file['attachment_id'] ? wp_get_attachment_image_url( (int) $file['attachment_id'], array( 150, 150 ) ) : '';
+			}
+
+			$out[] = array(
+				'md5'         => $group['md5_hash'],
+				'count'       => (int) $group['files'],
+				'total_size'  => (int) $group['total_size'],
+				'excess_size' => (int) $group['excess_size'],
+				'files'       => $files,
+			);
+		}
+
+		return rest_ensure_response(
+			array(
+				'groups' => $out,
+				'total_groups' => count( $out ),
+			)
+		);
 	}
 }
 

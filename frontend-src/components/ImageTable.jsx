@@ -4,7 +4,7 @@ const { __ } = wp.i18n;
 
 import { api } from '../api';
 import { sizeFormat, numberFormat, dateFormat } from '../format';
-import { StatusBadge, Pagination } from './common';
+import { StatusBadge, RiskBadge, Pagination } from './common';
 import ReferenceModal from './ReferenceModal';
 
 /**
@@ -253,6 +253,9 @@ export default function ImageTable( { lockedStatus } ) {
 									{ row.reference_count > 0 && (
 										<div className="msw-file-meta">{ row.reference_count }×</div>
 									) }
+									<div className="msw-risk">
+										<RiskBadge level={ row.risk_level } />
+									</div>
 								</td>
 								<td>
 									<div className="msw-row-actions">

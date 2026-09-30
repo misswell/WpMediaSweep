@@ -40,10 +40,22 @@ check( 'scan task completed', 'completed' === MSW_Task_Manager::get( $task['id']
 
 global $wpdb;
 $images = $wpdb->prefix . 'ms_images';
-$rows   = $wpdb->get_results( "SELECT id, attachment_id, file_name, file_size, mime_type, width, height FROM {$images} ORDER BY id", ARRAY_A );
+$rows   = $wpdb->get_results( "SELECT id, attachment_id, file_name, file_size, mime_type, width, height, md5_hash, is_thumbnail, parent_file_id FROM {$images} WHERE is_thumbnail = 0 ORDER BY id", ARRAY_A );
 
-// Thumb variants are skipped; exactly 3 originals expected.
-check( '3 images indexed (thumbnails skipped)', 3 === count( $rows ), 'got ' . count( $rows ) );
+// Size variants are indexed too, but the 3 originals must be there.
+check( '3 original images indexed', 3 === count( $rows ), 'got ' . count( $rows ) );
+
+$total_files = (int) $wpdb->get_var( "SELECT COUNT(*) FROM {$images}" );
+check( 'size variants indexed as well', $total_files >= 3, "total={$total_files}" );
+
+$thumbs = (int) $wpdb->get_var( "SELECT COUNT(*) FROM {$images} WHERE is_thumbnail = 1" );
+if ( $thumbs > 0 ) {
+	$orphan_thumbs = (int) $wpdb->get_var( "SELECT COUNT(*) FROM {$images} WHERE is_thumbnail = 1 AND parent_file_id = 0" );
+	check( 'every size variant linked to a parent', 0 === $orphan_thumbs, "thumbs={$thumbs}, unlinked={$orphan_thumbs}" );
+}
+
+$no_hash = (int) $wpdb->get_var( "SELECT COUNT(*) FROM {$images} WHERE md5_hash = ''" );
+check( 'md5 hash computed for every file', 0 === $no_hash, "missing={$no_hash}" );
 
 $by_name = array();
 foreach ( $rows as $row ) {
@@ -83,8 +95,12 @@ while ( MSW_Task_Manager::tick() && $steps < 50 ) {
 }
 $trow  = MSW_Task_Manager::get( $task['id'] );
 check( 'batch compress completed', 'completed' === $trow['status'], "processed={$trow['processed']}" );
-$cnt = (int) $wpdb->get_var( "SELECT COUNT(*) FROM {$images} WHERE compressed = 1" );
-check( 'all 3 compressed', 3 === $cnt, "compressed={$cnt}" );
+$cnt = (int) $wpdb->get_var( "SELECT COUNT(*) FROM {$images} WHERE compressed = 1 AND is_thumbnail = 0" );
+check( 'all 3 originals compressed', 3 === $cnt, "compressed={$cnt}" );
+
+$thumb_compressed = (int) $wpdb->get_var( "SELECT COUNT(*) FROM {$images} WHERE compressed = 1 AND is_thumbnail = 1" );
+check( 'size variants left untouched by compressor', 0 === $thumb_compressed, "thumb_compressed={$thumb_compressed}" );
+
 check( 'backups exist for all', is_file( $basedir . '/2026/09/test1.jpg.ms-original' ) && is_file( $basedir . '/2026/09/test2.jpg.ms-original' ) && is_file( $basedir . '/2026/09/test3.png.ms-original' ) );
 
 // --- 3. Reference scan ----------------------------------------------------------
@@ -95,7 +111,7 @@ while ( MSW_Task_Manager::tick() && $steps < 100 ) {
 }
 check( 'reference scan completed', 'completed' === MSW_Task_Manager::get( $task['id'] )['status'], "steps={$steps}" );
 
-$rows = $wpdb->get_results( "SELECT id, file_name, reference_status, reference_count FROM {$images} ORDER BY id", ARRAY_A );
+$rows = $wpdb->get_results( "SELECT id, file_name, reference_status, reference_count, is_thumbnail FROM {$images} WHERE is_thumbnail = 0 ORDER BY id", ARRAY_A );
 $by_name = array();
 foreach ( $rows as $row ) {
 	$by_name[ $row['file_name'] ] = $row;
@@ -103,6 +119,23 @@ foreach ( $rows as $row ) {
 check( 'test1.jpg used (featured)', 'used' === $by_name['test1.jpg']['reference_status'] && (int) $by_name['test1.jpg']['reference_count'] > 0 );
 check( 'test2.jpg used (post content)', 'used' === $by_name['test2.jpg']['reference_status'] );
 check( 'test3.png unused', 'unused' === $by_name['test3.png']['reference_status'] );
+
+// Size variants mirror their parent status; none may be a fake "orphan".
+$unlinked = (int) $wpdb->get_var( "SELECT COUNT(*) FROM {$images} WHERE is_thumbnail = 1 AND reference_status IN ('unknown','orphan') AND parent_file_id > 0" );
+check( 'size variants follow parent reference status', 0 === $unlinked, "bad={$unlinked}" );
+
+$thumb_att = $wpdb->get_var( "SELECT t.attachment_id FROM {$images} t JOIN {$images} p ON t.parent_file_id = p.id WHERE t.is_thumbnail = 1 AND p.file_name = 'test1.jpg' LIMIT 1" );
+if ( null !== $thumb_att ) {
+	check( 'size variant inherits parent attachment id', 4 === (int) $thumb_att, 'att=' . $thumb_att );
+}
+
+// Risk grading.
+$risk_safe    = MSW_Rest_Images::risk_level( array( 'is_thumbnail' => 0, 'reference_status' => 'orphan' ) );
+$risk_careful = MSW_Rest_Images::risk_level( array( 'is_thumbnail' => 0, 'reference_status' => 'unused' ) );
+$risk_keep    = MSW_Rest_Images::risk_level( array( 'is_thumbnail' => 0, 'reference_status' => 'used' ) );
+check( 'risk: orphan -> safe', 'safe' === $risk_safe );
+check( 'risk: unused -> cautious', 'cautious' === $risk_careful );
+check( 'risk: used -> keep', 'keep' === $risk_keep );
 
 // Single-image analyze endpoint logic.
 $analysis = MSW_Reference_Detector::analyze_image( (int) $by_name['test2.jpg']['id'] );
@@ -127,9 +160,26 @@ check( 'file back in uploads', is_file( $basedir . '/2026/09/test3.png' ) );
 $att6 = get_post( 6 );
 check( 'attachment 6 untrashed', $att6 && 'trash' !== $att6->post_status );
 
-// --- 5. Stats sanity --------------------------------------------------------------
-$stats_row = $wpdb->get_row( "SELECT COUNT(*) AS c FROM {$images}", ARRAY_A );
-check( 'index has 3 rows after all flows', 3 === (int) $stats_row['c'], "got {$stats_row['c']}" );
+// --- 5. Duplicate detection (identical md5) -------------------------------------
+$copy = $basedir . '/2026/09/test2-copy.jpg';
+copy( $basedir . '/2026/09/test2.jpg', $copy );
+$scan  = MSW_Scanner::start();
+$steps = 0;
+while ( MSW_Task_Manager::tick() && $steps < 50 ) {
+	$steps++;
+}
+$dup_groups = $wpdb->get_results( "SELECT md5_hash, COUNT(*) c FROM {$images} WHERE is_thumbnail = 0 AND md5_hash <> '' GROUP BY md5_hash HAVING c > 1", ARRAY_A );
+check( 'identical copy detected as duplicate group', count( $dup_groups ) >= 1, 'groups=' . count( $dup_groups ) );
+if ( $dup_groups ) {
+	$dup_names = $wpdb->get_col( $wpdb->prepare( "SELECT file_name FROM {$images} WHERE is_thumbnail = 0 AND md5_hash = %s ORDER BY id", $dup_groups[0]['md5_hash'] ) );
+	check( 'duplicate group holds both copies', in_array( 'test2.jpg', $dup_names, true ) && in_array( 'test2-copy.jpg', $dup_names, true ), implode( ',', $dup_names ) );
+}
+@unlink( $copy );
+$wpdb->query( "DELETE FROM {$images} WHERE file_name = 'test2-copy.jpg'" );
+
+// --- 6. Stats sanity --------------------------------------------------------------
+$originals = (int) $wpdb->get_var( "SELECT COUNT(*) FROM {$images} WHERE is_thumbnail = 0" );
+check( 'index holds the 3 originals after all flows', 3 === $originals, "got {$originals}" );
 
 echo "\n" . ( 0 === $failures ? "E2E ALL CHECKS PASSED\n" : $failures . " E2E CHECK(S) FAILED\n" );
 exit( $failures ? 1 : 0 );

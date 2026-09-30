@@ -41,6 +41,12 @@ class MSW_Rest_Images {
 			$prepare[] = '%' . $wpdb->esc_like( $search ) . '%';
 		}
 
+		// Size variants are hidden by default; they are managed through their parent.
+		$thumbs = $request->get_param( 'thumbnails' );
+		if ( 'all' !== $thumbs ) {
+			$where[] = 'is_thumbnail = 0';
+		}
+
 		$where_sql = implode( ' AND ', $where );
 		$page      = max( 1, (int) $request->get_param( 'page' ) );
 		$per_page  = min( 100, max( 10, (int) $request->get_param( 'per_page' ) ) );
@@ -56,6 +62,7 @@ class MSW_Rest_Images {
 			$wpdb->prepare(
 				// phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared -- table name + static where fragments.
 				"SELECT id, attachment_id, file_name, file_rel_path, mime_type, width, height, file_size,
+						md5_hash, is_thumbnail, parent_file_id,
 						compressed, compressed_at, original_size, compressed_size, compression_ratio,
 						reference_status, reference_count
 				FROM {$table} WHERE {$where_sql} ORDER BY id DESC LIMIT %d OFFSET %d",
@@ -70,11 +77,14 @@ class MSW_Rest_Images {
 			$row['width']             = (int) $row['width'];
 			$row['height']            = (int) $row['height'];
 			$row['file_size']         = (int) $row['file_size'];
+			$row['is_thumbnail']      = (int) $row['is_thumbnail'];
+			$row['parent_file_id']    = (int) $row['parent_file_id'];
 			$row['compressed']        = (int) $row['compressed'];
 			$row['original_size']     = (int) $row['original_size'];
 			$row['compressed_size']   = (int) $row['compressed_size'];
 			$row['compression_ratio'] = (float) $row['compression_ratio'];
 			$row['reference_count']   = (int) $row['reference_count'];
+			$row['risk_level']        = self::risk_level( $row );
 			$row['thumbnail_url']     = self::thumbnail_url( $row );
 			$row['edit_url']          = $row['attachment_id']
 				? admin_url( 'post.php?post=' . $row['attachment_id'] . '&action=edit' )
@@ -90,6 +100,33 @@ class MSW_Rest_Images {
 				'total_pages' => (int) ceil( $total / $per_page ),
 			)
 		);
+	}
+
+	/**
+	 * Deletion risk grade for one indexed file.
+	 *
+	 *   keep      — referenced (red: do not delete)
+	 *   cautious  — no references found, but an attachment/size variant exists
+	 *   safe      — no attachment record at all (orphan file on disk)
+	 *
+	 * @param array $row Image row.
+	 * @return string
+	 */
+	public static function risk_level( $row ) {
+		if ( ! empty( $row['is_thumbnail'] ) ) {
+			return 'follow'; // Managed through the parent image.
+		}
+
+		switch ( $row['reference_status'] ) {
+			case 'used':
+				return 'keep';
+			case 'maybe':
+			case 'unused':
+				return 'cautious'; // Attachment exists but is not referenced (may be used outside scans).
+			case 'orphan':
+				return 'safe'; // No media library record; safe once reviewed.
+		}
+		return 'cautious';
 	}
 
 	/**

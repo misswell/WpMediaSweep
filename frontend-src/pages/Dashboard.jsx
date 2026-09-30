@@ -64,6 +64,11 @@ export default function Dashboard( { go } ) {
 				<StatCard label={ __( 'No references', 'mediasweep' ) } value={ numberFormat( stats.unused + stats.orphan ) } accent="#d63638"
 					sub={ stats.maybe_used > 0 ? numberFormat( stats.maybe_used ) + ' ' + __( 'maybe used', 'mediasweep' ) : null } />
 				<StatCard label={ __( 'Releasable space', 'mediasweep' ) } value={ sizeFormat( stats.releasable ) } accent="#d63638" />
+				<StatCard
+					label={ __( 'Duplicate groups', 'mediasweep' ) }
+					value={ numberFormat( stats.duplicate_groups || 0 ) }
+					sub={ stats.duplicate_savings > 0 ? sizeFormat( stats.duplicate_savings ) + ' ' + __( 'in identical copies', 'mediasweep' ) : null }
+				/>
 				<StatCard label={ __( 'Engine backends', 'mediasweep' ) } value={ backendLabel } sub={ __( 'local only', 'mediasweep' ) } />
 			</div>
 

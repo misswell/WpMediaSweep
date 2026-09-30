@@ -54,3 +54,17 @@ export const TASK_TYPE_LABELS = {
 	reference_scan: __('Reference scan', 'mediasweep'),
 	compress: __('Compression', 'mediasweep'),
 };
+
+export const RISK_LABELS = {
+	keep: __('Do not delete', 'mediasweep'),
+	cautious: __('Delete with care', 'mediasweep'),
+	safe: __('Safe to delete', 'mediasweep'),
+	follow: __('Follows parent', 'mediasweep'),
+};
+
+export const RISK_COLORS = {
+	keep: '#d63638',
+	cautious: '#dba617',
+	safe: '#00a32a',
+	follow: '#8c8f94',
+};

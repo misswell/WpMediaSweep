@@ -11,10 +11,12 @@ class MSW_Cron {
 
 	const TICK_HOOK   = 'msw_tick';
 	const PURGE_HOOK  = 'msw_cleanup_trash';
+	const BACKUP_HOOK = 'msw_cleanup_backups';
 
 	public static function init() {
 		add_action( self::TICK_HOOK, array( 'MSW_Task_Manager', 'tick' ) );
 		add_action( self::PURGE_HOOK, array( 'MSW_Cleaner', 'purge_expired' ) );
+		add_action( self::BACKUP_HOOK, array( 'MSW_Cleaner', 'purge_expired_backups' ) );
 
 		add_filter( 'cron_schedules', array( __CLASS__, 'schedules' ) );
 
@@ -23,6 +25,9 @@ class MSW_Cron {
 		}
 		if ( ! wp_next_scheduled( self::PURGE_HOOK ) ) {
 			wp_schedule_event( time() + 300, 'daily', self::PURGE_HOOK );
+		}
+		if ( ! wp_next_scheduled( self::BACKUP_HOOK ) ) {
+			wp_schedule_event( time() + 600, 'daily', self::BACKUP_HOOK );
 		}
 	}
 

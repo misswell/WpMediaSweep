@@ -111,10 +111,10 @@ class MSW_Scanner {
 					MSW_Logger::info(
 						'scan',
 						sprintf(
-							'Scan complete: %d files indexed, %d attachments matched, %d thumbnails skipped.',
+							'Scan complete: %d files indexed (%d size variants), %d attachments matched.',
 							$cursor['files_done'],
-							$cursor['matched'],
-							$cursor['thumb_skipped']
+							$cursor['thumb_skipped'],
+							$cursor['matched']
 						)
 					);
 					return false; // Task finished.
@@ -204,23 +204,42 @@ class MSW_Scanner {
 				$cursor['matched']++;
 			}
 			$cursor['last_meta_id'] = (int) $row['meta_id'];
+
+			// Size variants inherit the parent attachment id.
+			$wpdb->query(
+				$wpdb->prepare(
+					"UPDATE {$images} t JOIN {$images} p ON t.parent_file_id = p.id " // phpcs:ignore
+					. 'SET t.attachment_id = p.attachment_id, t.updated_at = %s '
+					. 'WHERE p.file_rel_path = %s AND t.is_thumbnail = 1',
+					current_time( 'mysql', true ),
+					$row['meta_value']
+				)
+			);
 		}
 
 		return true;
 	}
 
 	/**
-	 * Insert or refresh rows for a set of relative file paths.
+	 * Insert or refresh rows for a batch of files, computing md5 and linking
+	 * -WxH size variants to their parent image.
 	 *
-	 * @param string[] $rels   Relative paths (already filtered to real images).
-	 * @param string   $root   Uploads basedir.
-	 * @param array    $cursor Cursor (updated in place).
+	 * @param array   $items  Items: { rel, thumb }.
+	 * @param string  $root   Uploads basedir.
+	 * @param array   $cursor Cursor (updated in place).
 	 */
-	protected static function index_files( $rels, $root, &$cursor ) {
+	protected static function index_files( $items, $root, &$cursor ) {
 		global $wpdb;
 
 		$table = MSW_Database::table( MSW_Database::IMAGES );
 		$now   = current_time( 'mysql', true );
+
+		$rels        = array();
+		$thumb_flags = array();
+		foreach ( $items as $item ) {
+			$rels[]                = $item['rel'];
+			$thumb_flags[ $item['rel'] ] = (int) $item['thumb'];
+		}
 
 		$placeholders = implode( ',', array_fill( 0, count( $rels ), '%s' ) );
 		$existing     = $wpdb->get_col(
@@ -228,7 +247,9 @@ class MSW_Scanner {
 		);
 		$existing = array_flip( (array) $existing );
 
-		foreach ( $rels as $rel ) {
+		$inserted = array();
+		foreach ( $items as $item ) {
+			$rel  = $item['rel'];
 			$path = $root . '/' . $rel;
 			$size = @filesize( $path );
 			$info = @getimagesize( $path );
@@ -251,9 +272,11 @@ class MSW_Scanner {
 				'width'         => is_array( $info ) ? (int) $info[0] : 0,
 				'height'        => is_array( $info ) ? (int) $info[1] : 0,
 				'file_size'     => $size ? (int) $size : 0,
+				'md5_hash'      => $size ? md5_file( $path ) : '',
+				'is_thumbnail'  => (int) $item['thumb'],
 				'updated_at'    => $now,
 			);
-			$format = array( '%s', '%s', '%s', '%s', '%d', '%d', '%d', '%s' );
+			$format = array( '%s', '%s', '%s', '%s', '%d', '%d', '%d', '%s', '%d', '%s' );
 
 			if ( isset( $existing[ $rel ] ) ) {
 				$wpdb->update( $table, $data, array( 'file_rel_path' => $rel ), $format, array( '%s' ) );
@@ -265,16 +288,57 @@ class MSW_Scanner {
 
 			$cursor['files_done']++;
 		}
+
+		// Link size variants to their parent rows (same batch, same directory).
+		$thumb_rels = array();
+		foreach ( $items as $item ) {
+			if ( $item['thumb'] ) {
+				$thumb_rels[] = $item['rel'];
+			}
+		}
+
+		if ( $thumb_rels ) {
+			$parent_rels = array();
+			foreach ( $thumb_rels as $rel ) {
+				$parent_rels[] = preg_replace( '/-\d+x\d+(\.(?:' . implode( '|', self::IMAGE_EXTS ) . '))$/i', '$1', $rel );
+			}
+			$parent_rels = array_values( array_unique( $parent_rels ) );
+
+			$placeholders = implode( ',', array_fill( 0, count( $parent_rels ), '%s' ) );
+			$parents      = $wpdb->get_results(
+				$wpdb->prepare( "SELECT id, file_rel_path FROM {$table} WHERE file_rel_path IN ({$placeholders})", $parent_rels ), // phpcs:ignore
+				ARRAY_A
+			);
+			$parent_ids = array();
+			foreach ( (array) $parents as $parent ) {
+				$parent_ids[ $parent['file_rel_path'] ] = (int) $parent['id'];
+			}
+
+			foreach ( $thumb_rels as $rel ) {
+				$parent_rel = preg_replace( '/-\d+x\d+(\.(?:' . implode( '|', self::IMAGE_EXTS ) . '))$/i', '$1', $rel );
+				$parent_id  = isset( $parent_ids[ $parent_rel ] ) ? $parent_ids[ $parent_rel ] : 0;
+				if ( $parent_id ) {
+					$wpdb->query(
+						$wpdb->prepare(
+							"UPDATE {$table} SET parent_file_id = %d WHERE file_rel_path = %s AND is_thumbnail = 1", // phpcs:ignore
+							$parent_id,
+							$rel
+						)
+					);
+				}
+			}
+		}
 	}
 
 	/**
-	 * Files in one directory, filtered to supported images, relative to uploads.
-	 * Hidden files, backups (.ms-original), temp files and -WxH thumbnails are skipped.
+	 * Files in one directory, relative to uploads, with thumbnail flag.
+	 * Hidden files, backups (.ms-original) and temp files are skipped.
+	 * WordPress -WxH size variants are indexed too, linked to their parent.
 	 *
 	 * @param string $dir    Absolute dir.
 	 * @param string $root   Uploads root.
-	 * @param array  $cursor Cursor (thumbnail skip counter updated in place).
-	 * @return string[] Sorted relative paths.
+	 * @param array  $cursor Cursor (thumbnail counter updated in place).
+	 * @return array[] Items: { rel, thumb } sorted by rel.
 	 */
 	protected static function list_images_in_dir( $dir, $root, &$cursor ) {
 		$out = array();
@@ -299,19 +363,25 @@ class MSW_Scanner {
 				continue;
 			}
 
-			// Native thumbnails are regenerated by WordPress, not index targets.
-			if ( preg_match( self::THUMB_PATTERN, $entry ) ) {
-				$cursor['thumb_skipped']++;
+			$rel = ltrim( substr( $path, strlen( $root ) ), '/' );
+			if ( ! $rel ) {
 				continue;
 			}
 
-			$rel = ltrim( substr( $path, strlen( $root ) ), '/' );
-			if ( $rel ) {
-				$out[] = $rel;
+			if ( preg_match( self::THUMB_PATTERN, $entry ) ) {
+				$cursor['thumb_skipped']++;
+				$out[] = array( 'rel' => $rel, 'thumb' => 1 );
+			} else {
+				$out[] = array( 'rel' => $rel, 'thumb' => 0 );
 			}
 		}
 
-		sort( $out );
+		usort(
+			$out,
+			function ( $a, $b ) {
+				return strcmp( $a['rel'], $b['rel'] );
+			}
+		);
 		return $out;
 	}
 

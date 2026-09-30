@@ -213,12 +213,12 @@ class MSW_Compressor {
 				}
 				$placeholders = implode( ',', array_fill( 0, count( $ids ), '%d' ) );
 				$rows = $wpdb->get_results(
-					$wpdb->prepare( "SELECT id, file_name FROM {$table} WHERE id IN ({$placeholders}) AND compressed = 0", ...$ids ), // phpcs:ignore
+					$wpdb->prepare( "SELECT id, file_name FROM {$table} WHERE id IN ({$placeholders}) AND compressed = 0 AND is_thumbnail = 0", ...$ids ), // phpcs:ignore
 					ARRAY_A
 				);
 			} else {
 				$rows = $wpdb->get_results(
-					$wpdb->prepare( "SELECT id, file_name FROM {$table} WHERE compressed = 0 AND id > %d ORDER BY id ASC LIMIT %d", $cursor['last_id'], $batch ),
+					$wpdb->prepare( "SELECT id, file_name FROM {$table} WHERE compressed = 0 AND is_thumbnail = 0 AND id > %d ORDER BY id ASC LIMIT %d", $cursor['last_id'], $batch ),
 					ARRAY_A
 				);
 			}
@@ -275,7 +275,7 @@ class MSW_Compressor {
 
 		if ( null === $selected ) {
 			$remaining = (int) $wpdb->get_var(
-				$wpdb->prepare( "SELECT COUNT(*) FROM {$table} WHERE compressed = 0 AND id > %d", $cursor['last_id'] )
+				$wpdb->prepare( "SELECT COUNT(*) FROM {$table} WHERE compressed = 0 AND is_thumbnail = 0 AND id > %d", $cursor['last_id'] )
 			);
 			if ( 0 === $remaining ) {
 				MSW_Logger::info(

@@ -49,6 +49,9 @@ class MSW_Database {
 			width int(11) NOT NULL DEFAULT 0,
 			height int(11) NOT NULL DEFAULT 0,
 			file_size bigint(20) unsigned NOT NULL DEFAULT 0,
+			md5_hash char(32) NOT NULL DEFAULT '',
+			is_thumbnail tinyint(1) NOT NULL DEFAULT 0,
+			parent_file_id bigint(20) unsigned NOT NULL DEFAULT 0,
 			compressed tinyint(1) NOT NULL DEFAULT 0,
 			compressed_at datetime NULL,
 			original_size bigint(20) unsigned NOT NULL DEFAULT 0,
@@ -64,6 +67,9 @@ class MSW_Database {
 			KEY file_name (file_name(100)),
 			KEY compressed (compressed),
 			KEY reference_status (reference_status),
+			KEY is_thumbnail (is_thumbnail),
+			KEY parent_file_id (parent_file_id),
+			KEY md5_hash (md5_hash),
 			KEY file_rel_path (file_rel_path(191))
 		) $charset;
 		CREATE TABLE {$refs} (

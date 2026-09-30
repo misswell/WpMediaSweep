@@ -186,6 +186,57 @@ class MSW_Cleaner {
 	}
 
 	/**
+	 * Purge .ms-original backups older than the configured retention window.
+	 * Runs daily via cron; retention 0 (default) keeps them forever.
+	 *
+	 * @return int Number of backup files removed.
+	 */
+	public static function purge_expired_backups() {
+		global $wpdb;
+
+		$retention = (int) MSW_Settings::get( 'backup_retention', 0 );
+		if ( $retention <= 0 ) {
+			return 0;
+		}
+
+		$cutoff = time() - $retention * DAY_IN_SECONDS;
+		$table  = MSW_Database::table( MSW_Database::IMAGES );
+		$last   = 0;
+		$batch  = 500;
+		$purged = 0;
+
+		while ( true ) {
+			$rows = $wpdb->get_results(
+				$wpdb->prepare( "SELECT id, file_path, file_name FROM {$table} WHERE id > %d ORDER BY id ASC LIMIT %d", $last, $batch ),
+				ARRAY_A
+			);
+
+			if ( ! $rows ) {
+				break;
+			}
+
+			foreach ( $rows as $row ) {
+				$last   = (int) $row['id'];
+				$backup = $row['file_path'] . MSW_Compressor::BACKUP_SUFFIX;
+
+				if ( ! is_file( $backup ) ) {
+					continue;
+				}
+
+				$mtime = @filemtime( $backup );
+				if ( $mtime && $mtime < $cutoff ) {
+					if ( @unlink( $backup ) ) {
+						$purged++;
+						MSW_Logger::info( 'cleanup', sprintf( 'Removed expired backup for %s (retention %d days).', $row['file_name'], $retention ) );
+					}
+				}
+			}
+		}
+
+		return $purged;
+	}
+
+	/**
 	 * List trash entries for the UI.
 	 *
 	 * @return array[]

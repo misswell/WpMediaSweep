@@ -498,7 +498,7 @@ class MSW_Reference_Detector {
 				"SELECT i.id, i.attachment_id,
 					( SELECT COUNT(*) FROM {$refs} r WHERE r.image_id = i.id AND r.reference_type <> 'post_content_maybe' ) AS hard,
 					( SELECT COUNT(*) FROM {$refs} r WHERE r.image_id = i.id AND r.reference_type = 'post_content_maybe' ) AS soft
-				FROM {$images} i WHERE i.id > %d ORDER BY i.id ASC LIMIT %d", // phpcs:ignore
+				FROM {$images} i WHERE i.id > %d AND i.is_thumbnail = 0 ORDER BY i.id ASC LIMIT %d", // phpcs:ignore
 				$cursor['last_id'],
 				$batch
 			),
@@ -506,6 +506,15 @@ class MSW_Reference_Detector {
 		);
 
 		if ( ! $rows ) {
+			// All originals are classified: size variants mirror their parent.
+			$wpdb->query(
+				$wpdb->prepare(
+					"UPDATE {$images} t JOIN {$images} p ON t.parent_file_id = p.id " // phpcs:ignore
+					. 'SET t.reference_status = p.reference_status, t.reference_count = p.reference_count, t.analyzed_at = %s '
+					. 'WHERE t.is_thumbnail = 1 AND t.parent_file_id > 0',
+					current_time( 'mysql', true )
+				)
+			);
 			self::next_phase( $cursor );
 			return false;
 		}
