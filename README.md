@@ -34,6 +34,10 @@ for WordPress media libraries*.
 
 Requires WordPress 5.8+, PHP 7.4+.
 
+### v0.3.5
+
+Adds the WordPress.org directory readme, GPL license text, privacy and retention documentation, and reproducible source/build links. The official-directory submission is prepared separately from the existing GitHub ZIP; approval and the assigned slug are tracked in [the submission notes](docs/wordpress-org-submission.md).
+
 ### v0.3.4
 
 - Separate **Unused** and **Trash** tabs, including Simplified Chinese labels.
