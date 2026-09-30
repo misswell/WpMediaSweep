@@ -71,7 +71,8 @@ class MSW_Rest_Images {
 			ARRAY_A
 		);
 
-		foreach ( (array) $rows as &$row ) {
+		$rows = (array) $rows;
+		foreach ( $rows as &$row ) {
 			$row['id']                = (int) $row['id'];
 			$row['attachment_id']     = (int) $row['attachment_id'];
 			$row['width']             = (int) $row['width'];
